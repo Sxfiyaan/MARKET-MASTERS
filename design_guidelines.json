@@ -1,0 +1,147 @@
+{
+  "project_name": "MARKET MASTERS: THE TRADING FLOOR",
+  "theme": "cinematic_dark_finance",
+  "emotional_archetype": "High-Stakes Wall Street Competition, Institutional Trading Floor, Tactical Precision",
+  "inspiration_references": [
+    "The Big Short (cinematic high contrast, intense typography)",
+    "Margin Call (dark midnight office, sleek financial terminal)",
+    "Scam 1992 (bold numbers, tension, gold & ticker aesthetics)",
+    "Bloomberg Terminal / TradingView Dark Mode UI"
+  ],
+  "colors": {
+    "background_primary": "#07090E",
+    "background_secondary": "#0D111A",
+    "surface_panel": "#131824",
+    "surface_panel_hover": "#1A2030",
+    "border_subtle": "#212A3E",
+    "border_bright": "#334155",
+    "text_primary": "#F8FAFC",
+    "text_secondary": "#94A3B8",
+    "text_muted": "#64748B",
+    "profit_green": "#00E676",
+    "profit_green_bg": "rgba(0, 230, 118, 0.12)",
+    "loss_red": "#FF3B30",
+    "loss_red_bg": "rgba(255, 59, 48, 0.12)",
+    "accent_gold": "#F59E0B",
+    "accent_gold_glow": "rgba(245, 158, 11, 0.25)",
+    "chart_grid_line": "#1E293B",
+    "ticker_bg": "#0B0F19"
+  },
+  "typography": {
+    "headline_font": "Instrument Serif, Playfair Display, Georgia, serif",
+    "body_font": "Inter, system-ui, sans-serif",
+    "mono_font": "JetBrains Mono, IBM Plex Mono, monospace",
+    "hierarchy": {
+      "h1_hero": "text-4xl sm:text-5xl lg:text-6xl font-serif tracking-tight leading-none",
+      "h2_section": "text-2xl sm:text-3xl lg:text-4xl font-serif tracking-tight",
+      "h3_card": "text-xl sm:text-2xl font-serif font-medium",
+      "mono_display_stat": "text-3xl sm:text-4xl lg:text-5xl font-mono tracking-tighter font-bold",
+      "mono_label": "text-xs font-mono uppercase tracking-widest text-slate-400",
+      "body": "text-sm sm:text-base text-slate-300 leading-relaxed"
+    }
+  },
+  "spacing_and_layout": {
+    "philosophy": "Tactical Density with Generous breathing room between structural sections. 1px precise borders, zero bulky shadows.",
+    "container_padding": "px-4 sm:px-8 lg:px-12 py-8 sm:py-16",
+    "panel_padding": "p-5 sm:p-7",
+    "grid_modes": {
+      "hero_layout": "grid grid-cols-1 lg:grid-cols-12 gap-8 items-center",
+      "rounds_bento": "grid grid-cols-1 md:grid-cols-3 gap-6",
+      "dashboard_grid": "grid grid-cols-1 lg:grid-cols-4 gap-6",
+      "terminal_layout": "grid grid-cols-1 lg:grid-cols-12 gap-6"
+    }
+  },
+  "visual_enhancers": {
+    "noise_overlay": "Subtle grain CSS overlay on hero and dark panels",
+    "ticker_marquee": "Continuous financial ticker crawl at header top with live crypto/forex/stock pairs",
+    "candlestick_motif": "SVG backdrop grid with glowing bullish green & bearish red candles",
+    "glow_effects": "Terminal green & amber subtle inner drop-shadows on active states",
+    "card_chrome": "1px solid #212A3E stroke with corner ticks (+) for high-tech institutional look"
+  },
+  "component_guidelines": {
+    "hero_section": {
+      "headline": "THE MARKET DOESN'T FORGIVE.",
+      "subheadline": "Think fast. Trade smart. Manage risk.",
+      "ctas": ["REGISTER YOUR TEAM", "VIEW EVENT RULES"],
+      "background": "Dark vignette with semi-transparent candlestick chart canvas overlay (bg-black/40 overlay max)"
+    },
+    "round_cards": [
+      {
+        "number": "01",
+        "title": "THE QUIZ",
+        "tagline": "KNOW THE MARKET.",
+        "details": "20-question finance & trading speed quiz"
+      },
+      {
+        "number": "02",
+        "title": "THE CALL",
+        "tagline": "READ THE CHART.",
+        "details": "Real-time chart pattern prediction: BUY / SELL / NO TRADE"
+      },
+      {
+        "number": "03",
+        "title": "THE TRADE",
+        "tagline": "ONE HOUR. TWO TRADES. ONE CHANCE TO WIN.",
+        "details": "1-Hour live simulation challenge with strict risk management & MAX 2 TRADES limit"
+      }
+    ],
+    "participant_dashboard": {
+      "header_stats": "Team Name, Rank badge with gold border, Total Score, Current Round, Time Remaining in JetBrains Mono",
+      "round_cards_status": "Status badges (LOCKED, IN PROGRESS, SUBMITTED, COMPLETED)"
+    },
+    "round_1_quiz": {
+      "timer": "Countdown bar with millisecond speed bonus calculation indicator",
+      "options": "A/B/C/D radio cards with glowing hover borders and selected highlight"
+    },
+    "round_2_chart_prediction": {
+      "chart_container": "Full-width candlestick viewer (OHLC data, Volume bar sub-chart)",
+      "action_buttons": {
+        "buy": "Solid Profit Green button (#00E676) with upward candle icon",
+        "sell": "Solid Loss Red button (#FF3B30) with downward candle icon",
+        "no_trade": "Solid Amber button (#F59E0B) for capital preservation decision"
+      }
+    },
+    "round_3_trading": {
+      "timer": "Server-authoritative 60:00 countdown timer display",
+      "trade_counter": "TRADES USED: X / 2 progress indicator banner",
+      "form_fields": ["Asset Pair / Symbol", "Account Size ($)", "Risk % per trade", "Stop Loss / Take Profit", "Net P/L ($)", "Result Status (PROFIT / LOSS)"],
+      "trade_limit_state": "Locked trading form with badge 'MAXIMUM TRADES REACHED' when 2 trades submitted"
+    },
+    "leaderboard": {
+      "columns": ["Rank", "Team Name", "College", "Round 1", "Round 2", "Round 3", "Risk Mgmt Score", "Total Score", "Trend"],
+      "rank_change": "Green arrow ↑ for position gain, Red arrow ↓ for drop, Grey dash — for stable",
+      "podium_top_3": "Gold #1, Silver #2, Bronze #3 visual callout banners"
+    },
+    "admin_dashboard": {
+      "sections": [
+        "Event Control Room (Start/Pause/End Round 1, 2, 3)",
+        "Question Management (CRUD for Round 1 & Round 2 charts)",
+        "Round 3 Trade Verification Queue (Pending, Verified, Rejected with Audit note)",
+        "Analytics Dashboard & CSV Data Exporter",
+        "Audit Log Stream & Announcement Broadcast System"
+      ]
+    },
+    "final_podium_page": {
+      "headline": "THE MARKET HAS SPOKEN.",
+      "layout": "Projector-optimized 3D-styled 1st, 2nd, 3rd podium display with confetti particle effects & comprehensive breakdown table"
+    }
+  },
+  "image_urls": {
+    "hero_trading_chart": "https://images.unsplash.com/photo-1689732888407-310424e3a372?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwyfHxzdG9jayUyMHRyYWRpbmclMjBmaW5hbmNpYWwlMjBjaGFydHMlMjB0ZXJtaW5hbCUyMHdhbGwlMjBzdHJlZXQlMjBkYXJrfGVufDB8fHx8MTc5MTM5ODg0OHww&ixlib=rb-4.1.0&q=85",
+    "candlestick_screen": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwxfHxzdG9jayUyMHRyYWRpbmclMjBmaW5hbmNpYWwlMjBjaGFydHMlMjB0ZXJtaW5hbCUyMHdhbGwlMjBzdHJlZXQlMjBkYXJrfGVufDB8fHx8MTc5MTM5ODg0OHww&ixlib=rb-4.1.0&q=85",
+    "trading_terminal_screen": "https://images.unsplash.com/photo-1691643158804-d3f02eb456a3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNTl8MHwxfHNlYXJjaHwzfHxzdG9jayUyMHRyYWRpbmclMjBmaW5hbmNpYWwlMjBjaGFydHMlMjB0ZXJtaW5hbCUyMHdhbGwlMjBzdHJlZXQlMjBkYXJrfGVufDB8fHx8MTc5MTM5ODg0OHww&ixlib=rb-4.1.0&q=85",
+    "wall_street_sign": "https://images.unsplash.com/photo-1701831737236-f365b205f578?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2Mzl8MHwxfHNlYXJjaHwyfHxzdG9jayUyMGV4Y2hhbmdlJTIwd2FsbCUyMHN0cmVldCUyMGZsb29yJTIwZGFyayUyMHJldHJvfGVufDB8fHx8MTc5MTM5ODg1NXww&ixlib=rb-4.1.0&q=85"
+  },
+  "testing_and_accessibility": {
+    "data_testid_convention": "kebab-case data-testid attributes mandatory on all inputs, action buttons, table rows, round cards, modal controls, and tab triggers",
+    "apca_contrast": "White text (#F8FAFC) on near-black (#07090E) exceeds 12:1 contrast ratio; green (#00E676) and red (#FF3B30) accompanied by readable icons/labels",
+    "motion_support": "Respect prefers-reduced-motion CSS query for marquee ticker and numeric count-ups"
+  },
+  "instructions_to_main_agent": [
+    "Follow the exact dark cinematic color palette with #07090E background, #131824 panels, and JetBrains Mono / Instrument Serif typography.",
+    "Ensure all interactive elements have data-testid attributes for testing.",
+    "Do not use transparent headers over hero images; use dark blurred backdrop blur.",
+    "Keep standard JS/JSX imports and React Router v7 structure compatible with the codebase.",
+    "Implement Sonner toast notifications for user interactions and trade verifications."
+  ]
+}
