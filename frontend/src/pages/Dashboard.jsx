@@ -11,22 +11,31 @@ const StateBadge = ({ state }) => {
   return <span className={`font-mono text-[10px] tracking-widest ${cls}`}>{label}</span>;
 };
 
-const RoundTile = ({ num, title, state, href, tid, cta }) => (
-  <div className="mm-panel mm-corner-ticks p-6" data-testid={tid}>
-    <div className="flex items-start justify-between">
-      <div className="font-mono text-[10px] tracking-widest text-mm-text2">ROUND / {num}</div>
-      <StateBadge state={state} />
+const RoundTile = ({ num, title, state, href, tid, cta }) => {
+  let actionElement = <button disabled className="btn-ghost opacity-50 cursor-not-allowed">Not Open</button>;
+  if (state === "ACTIVE") {
+    actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary inline-block">{cta}</Link>;
+  } else if (state === "PAUSED") {
+    actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary border-mm-gold text-mm-gold inline-block">Enter Round (Paused)</Link>;
+  } else if (state === "UPCOMING" && num === "01") {
+    actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">Enter Waiting Room</Link>;
+  } else if (state === "COMPLETED") {
+    actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">View Summary</Link>;
+  }
+
+  return (
+    <div className="mm-panel mm-corner-ticks p-6" data-testid={tid}>
+      <div className="flex items-start justify-between">
+        <div className="font-mono text-[10px] tracking-widest text-mm-text2">ROUND / {num}</div>
+        <StateBadge state={state} />
+      </div>
+      <div className="font-serif text-3xl mt-4">{title}</div>
+      <div className="mt-6">
+        {actionElement}
+      </div>
     </div>
-    <div className="font-serif text-3xl mt-4">{title}</div>
-    <div className="mt-6">
-      {state === "ACTIVE" ? (
-        <Link to={href} data-testid={`${tid}-enter`} className="btn-primary inline-block">{cta}</Link>
-      ) : (
-        <button disabled className="btn-ghost opacity-50 cursor-not-allowed">Not Open</button>
-      )}
-    </div>
-  </div>
-);
+  );
+};
 
 export default function Dashboard() {
   const { user } = useAuth();

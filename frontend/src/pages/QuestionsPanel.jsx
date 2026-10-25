@@ -10,33 +10,79 @@ export default function QuestionsPanel({ initialRound = 1 }) {
   const [qs, setQs] = useState([]);
   const [form, setForm] = useState(initialRound === 1 ? emptyR1() : emptyR2());
   const [editingId, setEditingId] = useState(null);
+  const [roundState, setRoundState] = useState("UPCOMING");
 
   const load = useCallback(async (r = round) => {
-    try { const { data } = await api.get("/questions", { params: { round: r } }); setQs(data); }
-    catch (e) { toast.error(formatApiError(e)); }
+    try {
+      const [qRes, cfgRes] = await Promise.all([
+        api.get("/questions", { params: { round: r } }),
+        api.get("/event/config"),
+      ]);
+      setQs(qRes.data);
+      const state = cfgRes.data?.rounds?.[String(r)]?.state || "UPCOMING";
+      setRoundState(state);
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
   }, [round]);
-  useEffect(() => { load(round); setForm(round === 1 ? emptyR1() : emptyR2()); setEditingId(null); }, [load, round]);
+
+  useEffect(() => {
+    load(round);
+    setForm(round === 1 ? emptyR1() : emptyR2());
+    setEditingId(null);
+  }, [load, round]);
+
+  const isLocked = round === 1 && (roundState === "ACTIVE" || roundState === "PAUSED");
 
   const save = async (e) => {
     e.preventDefault();
+    if (isLocked) {
+      toast.error("Cannot modify Round 1 questions while Round 1 is active or paused.");
+      return;
+    }
     try {
       const payload = { ...form, order: +form.order, base_points: +form.base_points, time_limit: +form.time_limit };
       if (editingId) await api.put(`/questions/${editingId}`, payload);
       else await api.post("/questions", payload);
       toast.success(editingId ? "Question updated" : "Question added");
-      setForm(round === 1 ? emptyR1() : emptyR2()); setEditingId(null); await load(round);
-    } catch (e) { toast.error(formatApiError(e)); }
+      setForm(round === 1 ? emptyR1() : emptyR2());
+      setEditingId(null);
+      await load(round);
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
   };
 
-  const edit = (q) => { setEditingId(q.id); setForm({ ...q, options: q.options || (round === 1 ? ["", "", "", ""] : ["BUY", "SELL", "NO_TRADE"]) }); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  const edit = (q) => {
+    if (isLocked) {
+      toast.error("Cannot edit questions while Round 1 is active or paused.");
+      return;
+    }
+    setEditingId(q.id);
+    setForm({ ...q, options: q.options || (round === 1 ? ["", "", "", ""] : ["BUY", "SELL", "NO_TRADE"]) });
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   const del = async (id) => {
+    if (isLocked) {
+      toast.error("Cannot delete questions while Round 1 is active or paused.");
+      return;
+    }
     if (!window.confirm("Delete this question?")) return;
-    try { await api.delete(`/questions/${id}`); toast.success("Deleted"); await load(round); }
-    catch (e) { toast.error(formatApiError(e)); }
+    try {
+      await api.delete(`/questions/${id}`);
+      toast.success("Deleted");
+      await load(round);
+    } catch (e) {
+      toast.error(formatApiError(e));
+    }
   };
 
-  const setOpt = (i) => (e) => { const next = [...form.options]; next[i] = e.target.value; setForm({ ...form, options: next }); };
+  const setOpt = (i) => (e) => {
+    const next = [...form.options];
+    next[i] = e.target.value;
+    setForm({ ...form, options: next });
+  };
 
   return (
     <div className="mt-8 space-y-6" data-testid={`admin-questions-panel-r${round}`}>
@@ -44,11 +90,22 @@ export default function QuestionsPanel({ initialRound = 1 }) {
         <div className="font-mono text-[11px] tracking-widest text-mm-gold">
           {round === 1 ? "// ROUND 1 · QUIZ QUESTIONS" : "// ROUND 2 · CHART QUESTIONS"}
         </div>
-        <span className="font-mono text-[11px] text-mm-text2 ml-auto">{qs.length} {round === 1 ? "question" : "chart"}{qs.length === 1 ? "" : "s"} added</span>
+        <span className="font-mono text-[11px] text-mm-text2 ml-auto">
+          {qs.length} {round === 1 ? "question" : "chart"}{qs.length === 1 ? "" : "s"} added
+        </span>
       </div>
 
+      {isLocked && (
+        <div className="p-4 border border-mm-gold/50 bg-mm-gold/10 mm-corner-ticks font-mono text-xs text-mm-gold flex items-center justify-between">
+          <span>⚠ ROUND 1 IS CURRENTLY {roundState}. Questions are locked from being added, edited, or deleted during active gameplay.</span>
+          <span className="px-2 py-0.5 bg-mm-gold text-black uppercase font-bold text-[10px]">LOCKED</span>
+        </div>
+      )}
+
       <form onSubmit={save} className="mm-panel mm-corner-ticks p-6 space-y-5" data-testid="q-form">
-        <div className="font-mono text-[11px] tracking-widest text-mm-gold">{editingId ? "// EDIT QUESTION" : "// ADD QUESTION"}</div>
+        <div className="font-mono text-[11px] tracking-widest text-mm-gold">
+          {editingId ? "// EDIT QUESTION" : "// ADD QUESTION"}
+        </div>
 
         {round === 2 && (
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -66,13 +123,22 @@ export default function QuestionsPanel({ initialRound = 1 }) {
 
         <label className="block">
           <div className="font-mono text-[10px] uppercase tracking-widest text-mm-text2 mb-2">Question Prompt</div>
-          <textarea data-testid="q-input-text" required rows={3} value={form.text || ""} onChange={(e) => setForm({ ...form, text: e.target.value })} className="w-full px-4 py-3 font-mono text-sm" placeholder={round === 1 ? "What does P/E stand for?" : "Describe the chart setup…"} />
+          <textarea
+            data-testid="q-input-text"
+            required
+            rows={3}
+            value={form.text || ""}
+            disabled={isLocked}
+            onChange={(e) => setForm({ ...form, text: e.target.value })}
+            className="w-full px-4 py-3 font-mono text-sm disabled:opacity-50"
+            placeholder={round === 1 ? "What does P/E stand for?" : "Describe the chart setup…"}
+          />
         </label>
 
         {round === 1 && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {["A", "B", "C", "D"].map((L, i) => (
-              <Field key={L} label={`Option ${L}`} value={form.options[i] || ""} onChange={setOpt(i)} tid={`q-input-opt-${L}`} required />
+              <Field key={L} label={`Option ${L}`} value={form.options[i] || ""} onChange={setOpt(i)} tid={`q-input-opt-${L}`} disabled={isLocked} required />
             ))}
           </div>
         )}
@@ -80,18 +146,39 @@ export default function QuestionsPanel({ initialRound = 1 }) {
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
           <label className="block">
             <div className="font-mono text-[10px] uppercase tracking-widest text-mm-text2 mb-2">Correct Answer</div>
-            <select data-testid="q-input-correct" value={form.correct_answer} onChange={(e) => setForm({ ...form, correct_answer: e.target.value })} className="w-full px-4 py-3 font-mono text-sm">
+            <select
+              data-testid="q-input-correct"
+              value={form.correct_answer}
+              disabled={isLocked}
+              onChange={(e) => setForm({ ...form, correct_answer: e.target.value })}
+              className="w-full px-4 py-3 font-mono text-sm disabled:opacity-50"
+            >
               {round === 1 ? ["A", "B", "C", "D"].map((v) => <option key={v} value={v}>{v}</option>) : ["BUY", "SELL", "NO_TRADE"].map((v) => <option key={v} value={v}>{v}</option>)}
             </select>
           </label>
-          <Field label="Base Points" type="number" min={1} value={form.base_points} onChange={(e) => setForm({ ...form, base_points: e.target.value })} tid="q-input-base" required />
-          <Field label="Time Limit (sec)" type="number" min={5} value={form.time_limit} onChange={(e) => setForm({ ...form, time_limit: e.target.value })} tid="q-input-time" required />
-          {round === 1 && <Field label="Order" type="number" min={0} value={form.order} onChange={(e) => setForm({ ...form, order: e.target.value })} tid="q-input-order" />}
+          <Field label="Base Points" type="number" min={1} value={form.base_points} disabled={isLocked} onChange={(e) => setForm({ ...form, base_points: e.target.value })} tid="q-input-base" required />
+          <Field label="Time Limit (sec)" type="number" min={5} value={form.time_limit} disabled={isLocked} onChange={(e) => setForm({ ...form, time_limit: e.target.value })} tid="q-input-time" required />
+          {round === 1 && <Field label="Order" type="number" min={0} value={form.order} disabled={isLocked} onChange={(e) => setForm({ ...form, order: e.target.value })} tid="q-input-order" />}
         </div>
 
         <div className="flex gap-3">
-          <button type="submit" data-testid="q-save" className="btn-primary">{editingId ? (round === 1 ? "Update Question" : "Update Chart") : (round === 1 ? "Add Question" : "Add Chart")}</button>
-          {editingId && <button type="button" onClick={() => { setEditingId(null); setForm(round === 1 ? emptyR1() : emptyR2()); }} className="btn-ghost">Cancel</button>}
+          <button
+            type="submit"
+            disabled={isLocked}
+            data-testid="q-save"
+            className="btn-primary disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {editingId ? (round === 1 ? "Update Question" : "Update Chart") : (round === 1 ? "Add Question" : "Add Chart")}
+          </button>
+          {editingId && (
+            <button
+              type="button"
+              onClick={() => { setEditingId(null); setForm(round === 1 ? emptyR1() : emptyR2()); }}
+              className="btn-ghost"
+            >
+              Cancel
+            </button>
+          )}
         </div>
       </form>
 
@@ -124,8 +211,22 @@ export default function QuestionsPanel({ initialRound = 1 }) {
                 <td className="p-3 text-right font-mono">{q.base_points}</td>
                 <td className="p-3 text-right font-mono">{q.time_limit}</td>
                 <td className="p-3 whitespace-nowrap">
-                  <button onClick={() => edit(q)} data-testid={`q-edit-${q.id}`} className="text-[11px] font-mono tracking-widest text-mm-gold hover:underline mr-3">EDIT</button>
-                  <button onClick={() => del(q.id)} data-testid={`q-delete-${q.id}`} className="text-[11px] font-mono tracking-widest text-mm-red hover:underline">DELETE</button>
+                  <button
+                    onClick={() => edit(q)}
+                    disabled={isLocked}
+                    data-testid={`q-edit-${q.id}`}
+                    className="text-[11px] font-mono tracking-widest text-mm-gold hover:underline mr-3 disabled:opacity-30 disabled:no-underline"
+                  >
+                    EDIT
+                  </button>
+                  <button
+                    onClick={() => del(q.id)}
+                    disabled={isLocked}
+                    data-testid={`q-delete-${q.id}`}
+                    className="text-[11px] font-mono tracking-widest text-mm-red hover:underline disabled:opacity-30 disabled:no-underline"
+                  >
+                    DELETE
+                  </button>
                 </td>
               </tr>
             ))}
@@ -141,7 +242,7 @@ function Field({ label, tid, ...p }) {
   return (
     <label className="block">
       <div className="font-mono text-[10px] uppercase tracking-widest text-mm-text2 mb-2">{label}</div>
-      <input {...p} data-testid={tid} className="w-full px-4 py-3 font-mono text-sm" />
+      <input {...p} data-testid={tid} className="w-full px-4 py-3 font-mono text-sm disabled:opacity-50" />
     </label>
   );
 }

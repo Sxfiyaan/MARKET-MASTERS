@@ -1,18 +1,29 @@
-import { createClient, type SupabaseClient, type User } from "npm:@supabase/supabase-js@2.57.4";
+import { createClient, type SupabaseClient, type User } from "@supabase/supabase-js";
 
 type Row = Record<string, any>;
 
-const supabaseUrl = Deno.env.get("SUPABASE_URL");
-const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
-if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase function environment is incomplete");
+const getEnv = (key: string): string | undefined => {
+  if (typeof Deno !== "undefined" && (Deno as any).env) return (Deno as any).env.get(key);
+  if (typeof process !== "undefined" && process.env) return process.env[key];
+  return undefined;
+};
 
-const db = createClient(supabaseUrl, serviceRoleKey, {
-  auth: { autoRefreshToken: false, persistSession: false },
-});
+const supabaseUrl = getEnv("SUPABASE_URL");
+const serviceRoleKey = getEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+let db = (supabaseUrl && serviceRoleKey)
+  ? createClient(supabaseUrl, serviceRoleKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    })
+  : (null as unknown as SupabaseClient);
+
+export function setTestDb(client: any) {
+  db = client;
+}
 
 const CACHE_TTL_MS = 5_000;
 let configCache: { value: Row; expiresAt: number } | null = null;
-let leaderboardCache: { value: Row[]; expiresAt: number } | null = null;
+let leaderboardCache: { key: string; value: Row[]; expiresAt: number } | null = null;
 let leaderboardRefresh: Promise<Row[]> | null = null;
 
 const DEFAULT_CONFIG = {
@@ -39,7 +50,28 @@ const DEFAULT_CONFIG = {
   },
 };
 
-class ApiError extends Error {
+const DEFAULT_R1_STATE: Row = {
+  id: "current",
+  version: 1,
+  status: "IDLE",
+  phase: "WAITING",
+  current_question_index: 0,
+  current_question_id: null,
+  total_questions: 0,
+  phase_start_at: null,
+  phase_ends_at: null,
+  is_paused: false,
+  paused_at: null,
+  pause_phase: null,
+  paused_remaining_ms: 0,
+  countdown_seconds: 10,
+  result_seconds: 10,
+  closed_question_ids: [],
+  frozen_questions: null,
+  speed_bonus_pct: 0.5,
+};
+
+export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
     super(message);
@@ -146,7 +178,7 @@ async function currentUser(request: Request, required = true): Promise<{ auth: U
   const { data, error } = await db.auth.getUser(token);
   if (error || !data.user) throw new ApiError(401, "Invalid or expired session");
   let profile = await one("profiles", { id: data.user.id });
-  const adminEmail = (Deno.env.get("ADMIN_EMAIL") || "").toLowerCase();
+  const adminEmail = (getEnv("ADMIN_EMAIL") || "").toLowerCase();
   if (!profile && adminEmail && data.user.email?.toLowerCase() === adminEmail) {
     profile = await insert("profiles", { id: data.user.id, email: data.user.email, name: data.user.user_metadata?.name || "Admin", role: "admin" });
   }
@@ -154,11 +186,11 @@ async function currentUser(request: Request, required = true): Promise<{ auth: U
   return { auth: data.user, profile };
 }
 
-function invalidateConfigCache() {
+export function invalidateConfigCache() {
   configCache = null;
 }
 
-function invalidateLeaderboardCache() {
+export function invalidateLeaderboardCache() {
   leaderboardCache = null;
 }
 
@@ -184,7 +216,7 @@ async function audit(action: string, user: { auth: User; profile: Row } | null, 
   });
 }
 
-async function config() {
+export async function config() {
   if (configCache && configCache.expiresAt > Date.now()) return configCache.value;
   const value = (await one("event_config", { id: "event" })) || DEFAULT_CONFIG;
   configCache = { value, expiresAt: Date.now() + CACHE_TTL_MS };
@@ -202,16 +234,113 @@ function profileOut(profile: Row, team?: Row | null) {
   return { id: profile.id, email: profile.email, name: profile.name, role: profile.role, team_id: profile.team_id, ...(team ? { team } : {}) };
 }
 
-async function computeScores() {
+// Single consistent definition of whether a Round 1 question is closed
+export function isQuestionClosed(r1State: Row | null, questionId: string): boolean {
+  if (!r1State || !questionId) return false;
+  const closedIds = Array.isArray(r1State.closed_question_ids) ? r1State.closed_question_ids : [];
+  return closedIds.includes(questionId);
+}
+
+// Durable Round 1 state loader with controlled error handling
+export async function getRound1State(): Promise<Row> {
+  const { data, error } = await db.from("round1_state").select("*").eq("id", "current").maybeSingle();
+  if (error) {
+    if (error.code === "42P01" || error.message?.includes("does not exist")) {
+      throw new ApiError(500, "Round 1 database schema is not initialized. Please apply migration 202610250007_market_masters_synchronized_round1.sql.");
+    }
+    throw new ApiError(500, `Database error loading Round 1 state: ${error.message}`);
+  }
+  if (!data) {
+    throw new ApiError(500, "Round 1 state row 'current' is missing. Please run migration 202610250007_market_masters_synchronized_round1.sql.");
+  }
+  return data;
+}
+
+// Checked versioned update preventing stale requests from overwriting newer phase or pause
+export async function saveRound1State(updates: Row, expectedVersion?: number): Promise<Row> {
+  const nextVersion = expectedVersion !== undefined ? expectedVersion + 1 : undefined;
+  let query = db
+    .from("round1_state")
+    .update({
+      ...updates,
+      ...(nextVersion !== undefined ? { version: nextVersion } : {}),
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", "current");
+
+  if (expectedVersion !== undefined) {
+    query = query.eq("version", expectedVersion);
+  }
+
+  const { data, error } = await query.select().maybeSingle();
+
+  if (error) {
+    if (error.code === "42P01" || error.message?.includes("does not exist")) {
+      throw new ApiError(500, "Round 1 database schema is not initialized. Please apply migration 202610250007_market_masters_synchronized_round1.sql.");
+    }
+    throw new ApiError(500, `Database error saving Round 1 state: ${error.message}`);
+  }
+
+  if (!data) {
+    if (expectedVersion !== undefined) {
+      throw new ApiError(409, "Round 1 state conflict: state was modified by a concurrent request. Please refresh and try again.");
+    }
+    throw new ApiError(500, "Failed to update Round 1 state: record 'current' was not found.");
+  }
+
+  invalidateLeaderboardCache();
+  return data;
+}
+
+// Procedural transactional phase advancement with row lock across edge instances
+export async function advanceRound1State(): Promise<Row> {
+  const nowIso = new Date().toISOString();
+  const { data: rpcData, error: rpcError } = await db.rpc("advance_round1_state_tx", {
+    p_now: nowIso,
+  });
+
+  if (!rpcError && rpcData) {
+    if (rpcData.error) {
+      throw new ApiError(500, rpcData.error);
+    }
+    invalidateLeaderboardCache();
+    if (rpcData.phase === "COMPLETED") {
+      invalidateConfigCache();
+    }
+    return rpcData;
+  }
+
+  if (rpcError) {
+    if (rpcError.code === "42883" || rpcError.code === "42P01" || rpcError.message?.includes("does not exist")) {
+      throw new ApiError(500, "Round 1 database schema or procedure is not initialized. Please apply migration 202610250007_market_masters_synchronized_round1.sql.");
+    }
+    throw new ApiError(500, `Database error advancing Round 1 state: ${rpcError.message}`);
+  }
+
+  return await getRound1State();
+}
+
+export async function computeScores() {
   const cfg = await config();
-  const [teams, submissions, trades, overrides, previous] = await Promise.all([
-    all("teams"), all("submissions"), all("trades"), all("score_overrides"), all("leaderboard_snapshot"),
+  const [teams, submissions, trades, overrides, previous, r1State] = await Promise.all([
+    all("teams"),
+    all("submissions"),
+    all("trades"),
+    all("score_overrides"),
+    all("leaderboard_snapshot"),
+    getRound1State(),
   ]);
+
+  // Unified closed questions check: Only count Round 1 submissions for genuinely CLOSED questions
+  const closedIds = new Set(Array.isArray(r1State?.closed_question_ids) ? r1State.closed_question_ids : []);
+
   const overrideMap = new Map(overrides.map((o) => [`${o.team_id}:${o.round}`, Number(o.new_score)]));
   const previousMap = new Map(previous.map((o) => [o.team_id, o.rank]));
   const rows: Row[] = teams.map((team) => {
     const tid = team.id;
-    const r1 = submissions.filter((s) => s.team_id === tid && s.round === 1).reduce((sum, s) => sum + Number(s.score || 0), 0);
+    const r1 = submissions
+      .filter((s) => s.team_id === tid && s.round === 1 && closedIds.has(s.question_id))
+      .reduce((sum, s) => sum + Number(s.score || 0), 0);
     const r2 = submissions.filter((s) => s.team_id === tid && s.round === 2).reduce((sum, s) => sum + Number(s.score || 0), 0);
     const round3Trades = trades.filter((t) => t.team_id === tid && t.verification_status !== "REJECTED");
     const totalPl = round3Trades.reduce((sum, t) => sum + Number(t.pl_percentage || 0), 0);
@@ -247,15 +376,20 @@ async function computeScores() {
   return rows;
 }
 
-async function scores() {
-  if (leaderboardCache && leaderboardCache.expiresAt > Date.now()) return leaderboardCache.value;
+export async function scores() {
+  const r1State = await getRound1State();
+  const cacheKey = `${r1State.version}:${r1State.status}:${r1State.phase}:${(r1State.closed_question_ids || []).join(",")}`;
+
+  if (leaderboardCache && leaderboardCache.key === cacheKey && leaderboardCache.expiresAt > Date.now()) {
+    return leaderboardCache.value;
+  }
   if (leaderboardRefresh) return leaderboardRefresh;
 
   const refresh = computeScores();
   leaderboardRefresh = refresh;
   try {
     const rows = await refresh;
-    leaderboardCache = { value: rows, expiresAt: Date.now() + CACHE_TTL_MS };
+    leaderboardCache = { key: cacheKey, value: rows, expiresAt: Date.now() + CACHE_TTL_MS };
     return rows;
   } finally {
     if (leaderboardRefresh === refresh) leaderboardRefresh = null;
@@ -278,7 +412,27 @@ function asQuestionBody(body: Row) {
   };
 }
 
-async function handle(request: Request) {
+// Edit lock preventing mutation or round re-assignment of R1 questions during active/paused round
+export async function assertRound1NotActive(targetRound?: number, questionId?: string) {
+  const r1 = await getRound1State();
+  const isR1ActiveOrPaused = r1.status === "ACTIVE" || r1.status === "COUNTDOWN" || r1.is_paused || (r1.status === "PAUSED");
+  if (!isR1ActiveOrPaused) return;
+
+  // 1. If target round specified in body is 1, reject
+  if (targetRound === 1) {
+    throw new ApiError(400, "Cannot modify Round 1 questions while Round 1 is active or paused");
+  }
+
+  // 2. If questionId is provided, check existing round in DB to prevent bypass by reassigning round to 2
+  if (questionId) {
+    const existing = await one("questions", { id: questionId });
+    if (existing && Number(existing.round) === 1) {
+      throw new ApiError(400, "Cannot modify or reassign a Round 1 question while Round 1 is active or paused");
+    }
+  }
+}
+
+export async function handle(request: Request) {
   const url = new URL(request.url);
   const functionMarker = "/market-api";
   const markerIndex = url.pathname.lastIndexOf(functionMarker);
@@ -346,41 +500,435 @@ async function handle(request: Request) {
 
   const roundState = path.match(/^\/api\/rounds\/(\d+)\/state$/);
   if (method === "POST" && roundState) {
-    const user = await adminUser(request); const round = Number(roundState[1]);
+    const user = await adminUser(request);
+    const round = Number(roundState[1]);
     if (![1, 2, 3].includes(round)) throw new ApiError(400, "Invalid round");
-    const body = await readBody(request); const state = requiredString(body.state, "state");
+    const body = await readBody(request);
+    const state = requiredString(body.state, "state");
     if (!["UPCOMING", "ACTIVE", "PAUSED", "COMPLETED"].includes(state)) throw new ApiError(400, "Invalid round state");
-    const cfg = await config(); const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds); const key = String(round);
-    const value = rounds[key] || { state: "UPCOMING", started_at: null, ended_at: null }; value.state = state;
+    const cfg = await config();
+    const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds);
+    const key = String(round);
+    const value = rounds[key] || { state: "UPCOMING", started_at: null, ended_at: null };
+
+    if (round === 1) {
+      const r1State = await advanceRound1State();
+
+      if (state === "ACTIVE") {
+        // Prevent ACTIVE from restarting COMPLETED
+        if (r1State.status === "COMPLETED" || r1State.phase === "COMPLETED") {
+          throw new ApiError(400, "Round 1 is completed. To start a new run, perform an explicit Reset Gameplay first.");
+        }
+        if (r1State.status === "ACTIVE" || r1State.status === "COUNTDOWN") {
+          // Repeated Start clicks must not restart the schedule!
+          return json(request, value);
+        }
+        if (r1State.is_paused) {
+          // Resume! Preserve remaining time; do not use || 10000 fallback
+          const remainingMs = Math.max(0, Number(r1State.paused_remaining_ms ?? 0));
+          if (remainingMs === 0) {
+            // Preserved paused_remaining_ms = 0.
+            // If remainingMs === 0, deadline had passed; unpause at current time and advance immediately without extra question time
+            await saveRound1State({
+              is_paused: false,
+              paused_at: null,
+              paused_remaining_ms: 0,
+              pause_phase: null,
+              phase_ends_at: new Date().toISOString(),
+              status: r1State.pause_phase === "COUNTDOWN" ? "COUNTDOWN" : "ACTIVE",
+            }, r1State.version);
+            await advanceRound1State();
+          } else {
+            const newEndsAtMs = Date.now() + remainingMs;
+            const newEndsAt = new Date(newEndsAtMs).toISOString();
+
+            // If resuming in QUESTION phase, adjust phase_start_at so active elapsed time is preserved
+            let newStartAt = r1State.phase_start_at;
+            if (r1State.pause_phase === "QUESTION" && r1State.current_question_id) {
+              const q = (r1State.frozen_questions?.find((x: any) => x.id === r1State.current_question_id)) || (await one("questions", { id: r1State.current_question_id }));
+              const qLimitMs = (Number(q?.time_limit) || 30) * 1000;
+              newStartAt = new Date(newEndsAtMs - qLimitMs).toISOString();
+            }
+
+            await saveRound1State({
+              is_paused: false,
+              paused_at: null,
+              paused_remaining_ms: 0,
+              pause_phase: null,
+              phase_start_at: newStartAt,
+              phase_ends_at: newEndsAt,
+              status: r1State.pause_phase === "COUNTDOWN" ? "COUNTDOWN" : "ACTIVE",
+            }, r1State.version);
+          }
+        } else {
+          // Fresh start from UPCOMING or IDLE: Freeze question set at activation!
+          const qs = await all("questions", { round: 1 }, ["question_order", true]);
+          if (!qs.length) throw new ApiError(400, "No Round 1 questions configured");
+
+          const frozenQuestions = qs.map((q) => ({
+            id: q.id,
+            round: 1,
+            text: q.text,
+            options: q.options || [],
+            correct_answer: q.correct_answer,
+            base_points: Number(q.base_points ?? 100),
+            time_limit: Number(q.time_limit ?? 30),
+            question_order: Number(q.question_order ?? 0),
+            asset: q.asset ?? null,
+            timeframe: q.timeframe ?? null,
+            chart_image_url: q.chart_image_url ?? null,
+          }));
+
+          await saveRound1State({
+            status: "COUNTDOWN",
+            phase: "COUNTDOWN",
+            current_question_index: 0,
+            current_question_id: qs[0].id,
+            total_questions: qs.length,
+            phase_start_at: new Date().toISOString(),
+            phase_ends_at: new Date(Date.now() + 10000).toISOString(),
+            is_paused: false,
+            paused_at: null,
+            paused_remaining_ms: 0,
+            pause_phase: null,
+            closed_question_ids: [],
+            frozen_questions: frozenQuestions,
+            speed_bonus_pct: Number(cfg.speed_bonus_pct ?? 0.5),
+          }, r1State.version);
+        }
+      } else if (state === "PAUSED") {
+        if ((r1State.status === "ACTIVE" || r1State.status === "COUNTDOWN") && !r1State.is_paused) {
+          const now = Date.now();
+          const endsAt = r1State.phase_ends_at ? new Date(r1State.phase_ends_at).getTime() : now;
+          const remainingMs = Math.max(0, endsAt - now);
+          await saveRound1State({
+            is_paused: true,
+            paused_at: new Date(now).toISOString(),
+            pause_phase: r1State.phase,
+            paused_remaining_ms: remainingMs,
+            status: "PAUSED",
+          }, r1State.version);
+        }
+      } else if (state === "COMPLETED") {
+        // Manual completion must NOT mark the current unfinished question as closed
+        await saveRound1State({
+          status: "COMPLETED",
+          phase: "COMPLETED",
+          is_paused: false,
+          paused_remaining_ms: 0,
+          current_question_id: null,
+        }, r1State.version);
+      } else if (state === "UPCOMING") {
+        // Prevent UPCOMING from reopening a played round with old answers!
+        const closedCount = (r1State.closed_question_ids || []).length;
+        if (r1State.status === "COMPLETED" || closedCount > 0) {
+          throw new ApiError(400, "Cannot return a played or completed round to UPCOMING. Perform an explicit Reset Gameplay first.");
+        }
+        const existingSubs = await all("submissions", { round: 1 });
+        if (existingSubs.length > 0) {
+          throw new ApiError(400, "Cannot return a played round with existing submissions to UPCOMING. Perform an explicit Reset Gameplay first.");
+        }
+
+        await saveRound1State({
+          status: "IDLE",
+          phase: "WAITING",
+          current_question_index: 0,
+          current_question_id: null,
+          is_paused: false,
+          paused_remaining_ms: 0,
+          pause_phase: null,
+          closed_question_ids: [],
+          frozen_questions: null,
+        }, r1State.version);
+      }
+    }
+
+    value.state = state;
     if (state === "ACTIVE" && !value.started_at) value.started_at = new Date().toISOString();
-    if (state === "COMPLETED") value.ended_at ||= new Date().toISOString(); rounds[key] = value;
+    if (state === "COMPLETED") value.ended_at ||= new Date().toISOString();
+    rounds[key] = value;
     const { error } = await db.from("event_config").update({ rounds }).eq("id", "event");
-    if (error) throw new ApiError(500, error.message); invalidateConfigCache(); await audit(`round${round}_state_change`, user, { state }); return json(request, value);
+    if (error) throw new ApiError(500, error.message);
+    invalidateConfigCache();
+    invalidateLeaderboardCache();
+    await audit(`round${round}_state_change`, user, { state });
+    return json(request, value);
+  }
+
+  // Synchronized Round 1 participant status
+  if (method === "GET" && path === "/api/rounds/1/status") {
+    const user = await currentUser(request);
+    const state = await advanceRound1State();
+    const cfg = await config();
+    const teamId = user!.profile.team_id;
+
+    const now = Date.now();
+    let timeLeft = 0;
+    if (state.is_paused) {
+      timeLeft = Math.max(0, Math.round(Number(state.paused_remaining_ms ?? 0) / 1000));
+    } else if (state.phase_ends_at) {
+      timeLeft = Math.max(0, Math.round((new Date(state.phase_ends_at).getTime() - now) / 1000));
+    }
+
+    let questionData: Row | null = null;
+    let teamSubmission: Row = { answered: false };
+    let teamScore = 0;
+    let standings: Row | null = null;
+    let leaderboardRows: Row[] = [];
+
+    const isCurClosed = isQuestionClosed(state, state.current_question_id);
+
+    if (state.current_question_id && (state.phase === "QUESTION" || state.phase === "RESULT")) {
+      const q = (state.frozen_questions?.find((x: any) => x.id === state.current_question_id)) || (await one("questions", { id: state.current_question_id }));
+      if (q) {
+        if (!isCurClosed) {
+          // Never leak correct_answer during active or paused question phase
+          questionData = {
+            id: q.id,
+            round: 1,
+            text: q.text,
+            options: q.options || [],
+            base_points: q.base_points,
+            time_limit: q.time_limit,
+            order: q.question_order,
+          };
+        } else {
+          // Reveal correct_answer in RESULT phase
+          questionData = questionOut(q, true);
+        }
+      }
+
+      if (teamId) {
+        const sub = await one("submissions", { team_id: teamId, question_id: state.current_question_id });
+        if (sub) {
+          if (!isCurClosed) {
+            // Never leak correctness, score, or time_taken before the question closes
+            teamSubmission = {
+              answered: true,
+              answer: sub.answer,
+              submitted_at: sub.submitted_at,
+            };
+          } else {
+            // Reveal in RESULT phase
+            teamSubmission = {
+              answered: true,
+              answer: sub.answer,
+              correct: sub.correct,
+              score: sub.score,
+              time_taken: sub.time_taken,
+              submitted_at: sub.submitted_at,
+            };
+          }
+        }
+      }
+    }
+
+    // Cumulative team score only sums genuinely closed questions
+    if (teamId) {
+      const teamSubs = await all("submissions", { team_id: teamId, round: 1 });
+      const closedIds = new Set(Array.isArray(state?.closed_question_ids) ? state.closed_question_ids : []);
+      teamScore = teamSubs
+        .filter((s) => closedIds.has(s.question_id))
+        .reduce((sum, s) => sum + Number(s.score || 0), 0);
+    }
+
+    // Include full agreed leaderboard in RESULT and COMPLETED phases
+    if (state.phase === "RESULT" || state.phase === "COMPLETED") {
+      const allSc = await scores();
+      if (teamId) {
+        const me = allSc.find((s) => s.team_id === teamId);
+        if (me) standings = { rank: me.rank, total: me.total, round1: me.round1 };
+      }
+      leaderboardRows = allSc.slice(0, 10).map((r) => ({
+        rank: r.rank,
+        team_id: r.team_id,
+        team_name: r.team_name,
+        college: r.college,
+        round1: r.round1,
+        total: r.total,
+      }));
+    }
+
+    return json(request, {
+      server_time: new Date().toISOString(),
+      status: state.status,
+      phase: state.phase,
+      is_paused: Boolean(state.is_paused),
+      paused_phase: state.pause_phase || null,
+      time_left: timeLeft,
+      phase_start_at: state.phase_start_at,
+      phase_ends_at: state.phase_ends_at,
+      question_index: state.current_question_index,
+      total_questions: state.total_questions,
+      countdown_seconds: state.countdown_seconds || 10,
+      result_seconds: state.result_seconds || 10,
+      question: questionData,
+      team_submission: teamSubmission,
+      team_score: teamScore,
+      standings,
+      leaderboard: leaderboardRows,
+      round_state: cfg.rounds?.["1"]?.state || "UPCOMING",
+    });
   }
 
   if (method === "GET" && path === "/api/questions") {
-    const user = await currentUser(request); const round = Number(url.searchParams.get("round"));
+    const user = await currentUser(request);
+    const round = Number(url.searchParams.get("round"));
     if (![1, 2].includes(round)) throw new ApiError(422, "round must be 1 or 2");
-    const rows = await all("questions", { round }, ["question_order", true]); return json(request, rows.map((row) => questionOut(row, user!.profile.role === "admin")));
+
+    // Prevent non-admin users from fetching the full Round 1 question list
+    if (round === 1 && user!.profile.role !== "admin") {
+      throw new ApiError(403, "Round 1 questions are synchronized. Use /rounds/1/status");
+    }
+
+    const rows = await all("questions", { round }, ["question_order", true]);
+    return json(request, rows.map((row) => questionOut(row, user!.profile.role === "admin")));
   }
 
-  if (method === "POST" && path === "/api/questions") { const user = await adminUser(request); const row = await insert("questions", asQuestionBody(await readBody(request))); await audit("question_create", user, { id: row.id, round: row.round }); return json(request, questionOut(row, true)); }
-  const questionId = path.match(/^\/api\/questions\/([^/]+)$/);
-  if (method === "PUT" && questionId) { const user = await adminUser(request); const update = asQuestionBody(await readBody(request)); const { data, error } = await db.from("questions").update(update).eq("id", questionId[1]).select().maybeSingle(); if (error) throw new ApiError(500, error.message); if (!data) throw new ApiError(404, "Question not found"); await audit("question_update", user, { id: questionId[1] }); return json(request, questionOut(data, true)); }
-  if (method === "DELETE" && questionId) { const user = await adminUser(request); await db.from("questions").delete().eq("id", questionId[1]); await audit("question_delete", user, { id: questionId[1] }); return json(request, { ok: true }); }
+  if (method === "POST" && path === "/api/questions") {
+    const user = await adminUser(request);
+    const body = await readBody(request);
+    await assertRound1NotActive(Number(body.round));
+    const row = await insert("questions", asQuestionBody(body));
+    await audit("question_create", user, { id: row.id, round: row.round });
+    return json(request, questionOut(row, true));
+  }
 
-  const submitPath = path.match(/^\/api\/rounds\/(\d+)\/submit$/);
-  if (method === "POST" && submitPath) {
-    const user = await teamUser(request); const round = Number(submitPath[1]); if (![1, 2].includes(round)) throw new ApiError(400, "Use /rounds/3/trades for round 3");
-    const cfg = await activeRound(round); const body = await readBody(request); const questionIdValue = requiredString(body.question_id, "question_id");
-    const question = await one("questions", { id: questionIdValue, round }); if (!question) throw new ApiError(404, "Question not found");
-    const answer = requiredString(body.answer, "answer").toUpperCase(); const timeTaken = Number(body.time_taken); if (!Number.isFinite(timeTaken) || timeTaken < 0) throw new ApiError(422, "time_taken must be non-negative");
-    const speedFactor = Math.max(0, 1 - timeTaken / Math.max(1, Number(question.time_limit))); const correct = answer === String(question.correct_answer).toUpperCase(); const score = correct ? Math.round(Number(question.base_points) * (1 + Number(cfg.speed_bonus_pct) * speedFactor)) : 0;
-    const row = await insert("submissions", { team_id: user.profile.team_id, question_id: questionIdValue, round, answer, correct, time_taken: timeTaken, score }); invalidateLeaderboardCache(); await audit(`round${round}_submit`, user, { question_id: questionIdValue, score }); return json(request, { correct, score, submission_id: row.id });
+  const questionId = path.match(/^\/api\/questions\/([^/]+)$/);
+  if (method === "PUT" && questionId) {
+    const user = await adminUser(request);
+    const body = await readBody(request);
+    await assertRound1NotActive(Number(body.round), questionId[1]);
+    const update = asQuestionBody(body);
+    const { data, error } = await db.from("questions").update(update).eq("id", questionId[1]).select().maybeSingle();
+    if (error) throw new ApiError(500, error.message);
+    if (!data) throw new ApiError(404, "Question not found");
+    await audit("question_update", user, { id: questionId[1] });
+    return json(request, questionOut(data, true));
+  }
+
+  if (method === "DELETE" && questionId) {
+    const user = await adminUser(request);
+    await assertRound1NotActive(undefined, questionId[1]);
+    await db.from("questions").delete().eq("id", questionId[1]);
+    await audit("question_delete", user, { id: questionId[1] });
+    return json(request, { ok: true });
+  }
+
+  // Synchronized Round 1 submit - Single execution path via atomic database procedure
+  if (method === "POST" && path === "/api/rounds/1/submit") {
+    const user = await teamUser(request);
+    const cfg = await config();
+    if (cfg.rounds?.["1"]?.state !== "ACTIVE") {
+      throw new ApiError(400, "Round 1 is not active");
+    }
+
+    const state = await advanceRound1State();
+    if (state.is_paused) throw new ApiError(400, "Round 1 is paused");
+    if (state.status !== "ACTIVE" || state.phase !== "QUESTION") {
+      throw new ApiError(400, "Question is not currently open");
+    }
+
+    const body = await readBody(request);
+    const questionIdValue = requiredString(body.question_id, "question_id");
+    if (state.current_question_id !== questionIdValue) {
+      throw new ApiError(400, "Question is not currently active");
+    }
+
+    // Server-side deadline check using server time
+    if (state.phase_ends_at && Date.now() >= new Date(state.phase_ends_at).getTime()) {
+      throw new ApiError(400, "Question deadline has expired");
+    }
+
+    const answer = requiredString(body.answer, "answer").toUpperCase();
+
+    // Single R1 submission path: Atomic database stored procedure (runs with service_role privileges)
+    const { data: rpcData, error: rpcError } = await db.rpc("submit_round1_answer", {
+      p_team_id: user.profile.team_id,
+      p_question_id: questionIdValue,
+      p_answer: answer,
+    });
+
+    if (rpcError) {
+      if (rpcError.code === "42883" || rpcError.code === "42P01" || rpcError.message?.includes("does not exist")) {
+        throw new ApiError(500, "Round 1 database procedure 'submit_round1_answer' is not initialized. Please apply migration 202610250007_market_masters_synchronized_round1.sql.");
+      }
+      throw new ApiError(500, `Database error during submission: ${rpcError.message}`);
+    }
+
+    if (!rpcData) {
+      throw new ApiError(500, "No response returned from submission procedure");
+    }
+
+    if (!rpcData.ok) {
+      if (rpcData.code === "ALREADY_SUBMITTED" || rpcData.error === "Already submitted") {
+        throw new ApiError(409, "Already submitted");
+      }
+      if (rpcData.code === "DEADLINE_EXPIRED") {
+        throw new ApiError(400, "Question deadline has expired");
+      }
+      if (rpcData.code === "NOT_OPEN" || rpcData.code === "NOT_ACTIVE") {
+        throw new ApiError(400, rpcData.error || "Question is not currently open");
+      }
+      if (rpcData.code === "NOT_OPEN_YET") {
+        throw new ApiError(400, "Question has not opened yet");
+      }
+      if (rpcData.code === "INVALID_TIMING") {
+        throw new ApiError(400, "Question timing is invalid");
+      }
+      throw new ApiError(400, rpcData.error || "Submission rejected");
+    }
+
+    invalidateLeaderboardCache();
+    await audit("round1_submit", user, { question_id: questionIdValue, submission_id: rpcData.submission_id });
+
+    // During QUESTION: Return strictly submission acknowledgement and accepted answer.
+    // Reveal correctness and points only after the shared deadline (via /rounds/1/status or /scores/me).
+    return json(request, {
+      ok: true,
+      submission_id: rpcData.submission_id,
+      answer,
+    });
+  }
+
+  // Round 2 submit (unchanged behavior)
+  if (method === "POST" && path === "/api/rounds/2/submit") {
+    const user = await teamUser(request);
+    const cfg = await activeRound(2);
+    const body = await readBody(request);
+    const questionIdValue = requiredString(body.question_id, "question_id");
+    const question = await one("questions", { id: questionIdValue, round: 2 });
+    if (!question) throw new ApiError(404, "Question not found");
+    const answer = requiredString(body.answer, "answer").toUpperCase();
+    const timeTaken = Number(body.time_taken);
+    if (!Number.isFinite(timeTaken) || timeTaken < 0) throw new ApiError(422, "time_taken must be non-negative");
+    const speedFactor = Math.max(0, 1 - timeTaken / Math.max(1, Number(question.time_limit)));
+    const correct = answer === String(question.correct_answer).toUpperCase();
+    const score = correct ? Math.round(Number(question.base_points) * (1 + Number(cfg.speed_bonus_pct) * speedFactor)) : 0;
+    const row = await insert("submissions", { team_id: user.profile.team_id, question_id: questionIdValue, round: 2, answer, correct, time_taken: timeTaken, score });
+    invalidateLeaderboardCache();
+    await audit("round2_submit", user, { question_id: questionIdValue, score });
+    return json(request, { correct, score, submission_id: row.id });
   }
 
   const mySubmissions = path.match(/^\/api\/rounds\/(\d+)\/my-submissions$/);
-  if (method === "GET" && mySubmissions) { const user = await teamUser(request); const round = Number(mySubmissions[1]); return json(request, await all("submissions", { team_id: user.profile.team_id, round }, ["submitted_at", true])); }
+  if (method === "GET" && mySubmissions) {
+    const user = await teamUser(request);
+    const round = Number(mySubmissions[1]);
+    const rows = await all("submissions", { team_id: user.profile.team_id, round }, ["submitted_at", true]);
+    if (round === 1) {
+      const r1State = await getRound1State();
+      // Mask any question that is not yet genuinely closed (including paused or unfinished questions)
+      const closedIds = new Set(Array.isArray(r1State?.closed_question_ids) ? r1State.closed_question_ids : []);
+      return json(request, rows.map((r) => {
+        if (!closedIds.has(r.question_id)) {
+          return { ...r, correct: null, score: null, time_taken: null };
+        }
+        return r;
+      }));
+    }
+    return json(request, rows);
+  }
 
   if (method === "POST" && path === "/api/rounds/3/start") {
     const user = await teamUser(request); const cfg = await activeRound(3); let session = await one("round3_sessions", { team_id: user.profile.team_id });
@@ -419,11 +967,66 @@ async function handle(request: Request) {
   if (method === "DELETE" && deleteTradePath) { const user = await adminUser(request); const trade = await one("trades", { id: deleteTradePath[1] }); if (!trade) throw new ApiError(404, "Trade not found"); await db.from("trades").delete().eq("id", deleteTradePath[1]); invalidateLeaderboardCache(); await audit("trade_delete", user, { trade_id: trade.id, team_id: trade.team_id }); return json(request, { ok: true }); }
 
   if (method === "POST" && path === "/api/admin/event/action") {
-    const user = await adminUser(request); const action = requiredString((await readBody(request)).action, "action"); if (!["start", "stop", "reset"].includes(action)) throw new ApiError(400, "action must be start | stop | reset"); const cfg = await config(); const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds);
-    if (action === "start") { for (const key of ["1", "2", "3"]) rounds[key] = { state: "UPCOMING", started_at: null, ended_at: null }; await db.from("event_config").update({ registration_open: true, leaderboard_visible: true, rounds }).eq("id", "event"); }
-    if (action === "stop") { const now = new Date().toISOString(); for (const key of ["1", "2", "3"]) { rounds[key].state = "COMPLETED"; rounds[key].ended_at ||= now; } await db.from("event_config").update({ registration_open: false, rounds }).eq("id", "event"); }
-    if (action === "reset") { for (const table of ["submissions", "trades", "round3_sessions", "score_overrides", "leaderboard_snapshot"]) await db.from(table).delete().not("team_id", "is", null); for (const key of ["1", "2", "3"]) rounds[key] = { state: "UPCOMING", started_at: null, ended_at: null }; await db.from("event_config").update({ rounds }).eq("id", "event"); }
-    invalidateConfigCache(); invalidateLeaderboardCache(); await audit(`event_${action}`, user); return json(request, await config());
+    const user = await adminUser(request);
+    const action = requiredString((await readBody(request)).action, "action");
+    if (!["start", "stop", "reset"].includes(action)) throw new ApiError(400, "action must be start | stop | reset");
+
+    const nowIso = new Date().toISOString();
+
+    if (action === "start") {
+      const cfg = await config();
+      const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds);
+      for (const key of ["1", "2", "3"]) rounds[key] = { state: "UPCOMING", started_at: null, ended_at: null };
+      await db.from("event_config").update({ registration_open: true, leaderboard_visible: true, rounds }).eq("id", "event");
+    }
+
+    if (action === "stop") {
+      // Transactional Stop Event: stops R1 and event_config in a single transaction
+      const { error: rpcError } = await db.rpc("admin_stop_event_tx", { p_now: nowIso });
+      if (rpcError) {
+        // Fallback update keeping round1_state and event_config consistent
+        const cfg = await config();
+        const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds);
+        for (const key of ["1", "2", "3"]) {
+          rounds[key].state = "COMPLETED";
+          rounds[key].ended_at ||= nowIso;
+        }
+        await db.from("event_config").update({ registration_open: false, rounds }).eq("id", "event");
+        const r1 = await getRound1State();
+        await saveRound1State({
+          status: "COMPLETED",
+          phase: "COMPLETED",
+          is_paused: false,
+          paused_remaining_ms: 0,
+          current_question_id: null,
+        }, r1.version);
+      }
+    }
+
+    if (action === "reset") {
+      // Transactional Reset: deletes gameplay data and resets state in a single transaction
+      const { error: rpcError } = await db.rpc("admin_reset_gameplay_tx", { p_now: nowIso });
+      if (rpcError) {
+        // If stored procedure not available, execute atomic cleanup sequence
+        for (const table of ["submissions", "trades", "round3_sessions", "score_overrides", "leaderboard_snapshot"]) {
+          await db.from(table).delete().not("team_id", "is", null);
+        }
+        const rounds = {
+          "1": { state: "UPCOMING", started_at: null, ended_at: null },
+          "2": { state: "UPCOMING", started_at: null, ended_at: null },
+          "3": { state: "UPCOMING", started_at: null, ended_at: null },
+        };
+        await db.from("event_config").update({ rounds }).eq("id", "event");
+        let curVer = 1;
+        try { const cur = await getRound1State(); curVer = cur.version || 1; } catch {}
+        await saveRound1State(DEFAULT_R1_STATE, curVer);
+      }
+    }
+
+    invalidateConfigCache();
+    invalidateLeaderboardCache();
+    await audit(`event_${action}`, user);
+    return json(request, await config());
   }
 
   if (method === "GET" && path === "/api/announcements") return publicJson(request, await all("announcements", {}, ["created_at", false]));
@@ -439,8 +1042,10 @@ async function handle(request: Request) {
   throw new ApiError(404, "Route not found");
 }
 
-Deno.serve(async (request) => {
-  if (request.method === "OPTIONS") return new Response("ok", { headers: jsonHeaders(request) });
-  try { return await handle(request); }
-  catch (error) { console.error(error); return json(request, { detail: error instanceof ApiError ? error.message : "Unexpected server error" }, error instanceof ApiError ? error.status : 500); }
-});
+if (typeof Deno !== "undefined" && (Deno as any).serve) {
+  (Deno as any).serve(async (request: Request) => {
+    if (request.method === "OPTIONS") return new Response("ok", { headers: jsonHeaders(request) });
+    try { return await handle(request); }
+    catch (error) { console.error(error); return json(request, { detail: error instanceof ApiError ? error.message : "Unexpected server error" }, error instanceof ApiError ? error.status : 500); }
+  });
+}
