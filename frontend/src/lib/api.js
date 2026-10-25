@@ -1,12 +1,14 @@
 import axios from "axios";
+import { supabase } from "@/lib/supabase";
 
-const BACKEND_URL = (process.env.REACT_APP_BACKEND_URL || "http://localhost:8000").replace(/\/$/, "");
-export const API_BASE = `${BACKEND_URL}/api`;
+const FUNCTIONS_URL = (process.env.REACT_APP_SUPABASE_FUNCTIONS_URL || `${process.env.REACT_APP_SUPABASE_URL}/functions/v1/market-api`).replace(/\/$/, "");
+export const API_BASE = `${FUNCTIONS_URL}/api`;
 
 export const api = axios.create({ baseURL: API_BASE });
 
-api.interceptors.request.use((cfg) => {
-  const token = localStorage.getItem("mm_token");
+api.interceptors.request.use(async (cfg) => {
+  const { data } = await supabase.auth.getSession();
+  const token = data.session?.access_token;
   if (token) cfg.headers.Authorization = `Bearer ${token}`;
   return cfg;
 });

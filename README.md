@@ -1,61 +1,54 @@
 # Market Masters
 
-Market Masters is a three-round trading competition platform with a React frontend, FastAPI API, and Supabase Postgres persistence. It also supports the original Emergent MongoDB runtime as a compatibility mode.
+Market Masters is a three-round trading competition platform built with React and Supabase. Authentication uses Supabase Auth, persistent data uses private Postgres tables with RLS enabled, and protected game/admin operations run in the `market-api` Supabase Edge Function.
 
-## Requirements
+## Supabase setup
 
-- Node.js 20+
-- Python 3.11+
-- A Supabase project with its Postgres connection pooler URL, or the original Emergent MongoDB runtime
+The existing project already has the legacy compatibility migrations applied. The native schema is defined in `supabase/migrations/202610250003_market_masters_native.sql` and the deployed function is `supabase/functions/market-api/index.ts`.
 
-## Local setup
+The function uses Supabase's server-side service key internally. It is never sent to the browser. The browser only receives the publishable key.
 
-1. Create `backend/.env` from `backend/.env.example`. Set the Supabase pooler URL plus admin credentials for Supabase, or set `MONGO_URL` and `DB_NAME` for the original Emergent environment. For an event, start with the documented pool defaults and adjust them only within your Supabase connection limits.
-2. If using Supabase, apply both files in `supabase/migrations/` in order. The API automatically prefers `SUPABASE_DB_URL` when both database configurations exist.
-3. Install and start the API:
+For the first administrator:
 
-   ```powershell
-   cd backend
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   pip install -r requirements.txt
-   uvicorn server:app --reload --port 8000
-   ```
+1. Create the admin user in Supabase Dashboard → Authentication → Users.
+2. Add an Edge Function secret named `ADMIN_EMAIL` with that same email.
+3. Sign in once through the app. The function creates the private admin profile automatically.
 
-4. In a second terminal, install and start the frontend:
+## Local frontend
 
-   ```powershell
-   cd frontend
-   corepack yarn install --frozen-lockfile
-   corepack yarn start
-   ```
+Create `frontend/.env.local` from `frontend/.env.example`:
 
-The frontend runs at `http://localhost:3000` and the API health endpoint is `http://localhost:8000/api/`.
+```env
+REACT_APP_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+REACT_APP_SUPABASE_PUBLISHABLE_KEY=sb_publishable_replace_me
+REACT_APP_SUPABASE_FUNCTIONS_URL=https://YOUR_PROJECT_REF.supabase.co/functions/v1/market-api
+```
 
-For Render deployment, use `render.yaml` and set `SUPABASE_DB_URL`, `JWT_SECRET`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and `CORS_ORIGINS` as Render secrets. The supplied Emergent variables (`MONGO_URL`, `DB_NAME`, `WDS_SOCKET_PORT`, and `ENABLE_HEALTH_CHECK`) are supported for that runtime; `WDS_SOCKET_PORT` and `ENABLE_HEALTH_CHECK` are frontend-dev settings and are not required by the production build.
+Then run:
 
-Do not put a Supabase personal access token in the app or frontend. PATs are for Supabase CLI/Management API operations; the backend uses the private Postgres connection string.
+```powershell
+cd frontend
+corepack yarn install --frozen-lockfile
+corepack yarn start
+```
 
-Demo data is disabled by default. Set `SEED_DEMO_DATA=true` and `DEMO_PASSWORD` in `backend/.env` only for local demonstrations.
+The frontend runs at `http://localhost:3000`. The Supabase API health endpoint is:
+
+```text
+https://YOUR_PROJECT_REF.supabase.co/functions/v1/market-api/api/
+```
+
+## Deployment
+
+Deploy the `frontend` directory to Vercel with the three `REACT_APP_SUPABASE_*` variables above. No Render, Railway, MongoDB, private database URL, JWT secret, or Supabase personal access token is required at runtime.
+
+Deploy updates to `supabase/functions/market-api/index.ts` through the Supabase Edge Function deployment workflow. Keep `SUPABASE_SERVICE_ROLE_KEY` inside Supabase Function secrets only.
 
 ## Validation
 
 ```powershell
 cd frontend
 corepack yarn build
-```
-
-```powershell
-cd backend
-python -m py_compile server.py
-```
-
-To run the repeatable API E2E test suite:
-
-```powershell
-cd backend
-pip install -r requirements-dev.txt
-python -m pytest -q
 ```
 
 Never commit `.env`, local virtual environments, `node_modules`, or build output.

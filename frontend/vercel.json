@@ -1,0 +1,8 @@
+{
+  "buildCommand": "corepack yarn install --frozen-lockfile && corepack yarn build",
+  "outputDirectory": "build",
+  "framework": "create-react-app",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

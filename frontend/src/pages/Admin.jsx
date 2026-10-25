@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import Nav from "@/components/Nav";
-import { api, formatApiError, API_BASE } from "@/lib/api";
+import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import QuestionsPanel from "@/pages/QuestionsPanel";
 
@@ -70,13 +70,12 @@ export default function Admin() {
     catch (e) { toast.error(formatApiError(e)); }
   };
 
-  const exportCsv = (kind) => {
-    const token = localStorage.getItem("mm_token");
-    fetch(`${API_BASE}/admin/export/${kind}`, { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => r.blob()).then((b) => {
-        const u = URL.createObjectURL(b); const a = document.createElement("a");
-        a.href = u; a.download = `${kind}.csv`; a.click(); URL.revokeObjectURL(u);
-      });
+  const exportCsv = async (kind) => {
+    try {
+      const { data } = await api.get(`/admin/export/${kind}`, { responseType: "blob" });
+      const u = URL.createObjectURL(data); const a = document.createElement("a");
+      a.href = u; a.download = `${kind}.csv`; a.click(); URL.revokeObjectURL(u);
+    } catch (e) { toast.error(formatApiError(e)); }
   };
 
   if (!cfg || !analytics) return <Shell><div className="font-mono text-xs text-mm-text2">Loading…</div></Shell>;
