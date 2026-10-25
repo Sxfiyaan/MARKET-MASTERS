@@ -10,6 +10,11 @@ const db = createClient(supabaseUrl, serviceRoleKey, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
+const CACHE_TTL_MS = 5_000;
+let configCache: { value: Row; expiresAt: number } | null = null;
+let leaderboardCache: { value: Row[]; expiresAt: number } | null = null;
+let leaderboardRefresh: Promise<Row[]> | null = null;
+
 const DEFAULT_CONFIG = {
   id: "event",
   event_name: "Market Masters: The Trading Floor",
@@ -55,6 +60,18 @@ const jsonHeaders = (request: Request) => {
 
 function json(request: Request, value: unknown, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: jsonHeaders(request) });
+}
+
+function publicJson(request: Request, value: unknown, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      ...jsonHeaders(request),
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=2, s-maxage=2, stale-while-revalidate=5",
+      "Vary": "Accept-Encoding",
+    },
+  });
 }
 
 function csv(request: Request, rows: Row[], filename: string) {
@@ -137,6 +154,14 @@ async function currentUser(request: Request, required = true): Promise<{ auth: U
   return { auth: data.user, profile };
 }
 
+function invalidateConfigCache() {
+  configCache = null;
+}
+
+function invalidateLeaderboardCache() {
+  leaderboardCache = null;
+}
+
 async function teamUser(request: Request) {
   const user = await currentUser(request);
   if (user!.profile.role !== "team" || !user!.profile.team_id) throw new ApiError(403, "Team only");
@@ -160,7 +185,10 @@ async function audit(action: string, user: { auth: User; profile: Row } | null, 
 }
 
 async function config() {
-  return (await one("event_config", { id: "event" })) || DEFAULT_CONFIG;
+  if (configCache && configCache.expiresAt > Date.now()) return configCache.value;
+  const value = (await one("event_config", { id: "event" })) || DEFAULT_CONFIG;
+  configCache = { value, expiresAt: Date.now() + CACHE_TTL_MS };
+  return value;
 }
 
 async function activeRound(round: number) {
@@ -174,7 +202,7 @@ function profileOut(profile: Row, team?: Row | null) {
   return { id: profile.id, email: profile.email, name: profile.name, role: profile.role, team_id: profile.team_id, ...(team ? { team } : {}) };
 }
 
-async function scores() {
+async function computeScores() {
   const cfg = await config();
   const [teams, submissions, trades, overrides, previous] = await Promise.all([
     all("teams"), all("submissions"), all("trades"), all("score_overrides"), all("leaderboard_snapshot"),
@@ -216,9 +244,30 @@ async function scores() {
     row.rank = rank;
     row.rank_change = old == null ? "NEW" : old > rank ? "UP" : old < rank ? "DOWN" : "SAME";
   });
-  await db.from("leaderboard_snapshot").delete().neq("team_id", "00000000-0000-0000-0000-000000000000");
-  if (rows.length) await db.from("leaderboard_snapshot").insert(rows.map((row) => ({ ...row, updated_at: new Date().toISOString() })));
   return rows;
+}
+
+async function scores() {
+  if (leaderboardCache && leaderboardCache.expiresAt > Date.now()) return leaderboardCache.value;
+  if (leaderboardRefresh) return leaderboardRefresh;
+
+  const refresh = computeScores();
+  leaderboardRefresh = refresh;
+  try {
+    const rows = await refresh;
+    leaderboardCache = { value: rows, expiresAt: Date.now() + CACHE_TTL_MS };
+    return rows;
+  } finally {
+    if (leaderboardRefresh === refresh) leaderboardRefresh = null;
+  }
+}
+
+async function persistLeaderboardSnapshot(rows: Row[]) {
+  const { error: deleteError } = await db.from("leaderboard_snapshot").delete().neq("team_id", "00000000-0000-0000-0000-000000000000");
+  if (deleteError) throw new ApiError(500, deleteError.message);
+  if (!rows.length) return;
+  const { error: insertError } = await db.from("leaderboard_snapshot").insert(rows.map((row) => ({ ...row, updated_at: new Date().toISOString() })));
+  if (insertError) throw new ApiError(500, insertError.message);
 }
 
 function asQuestionBody(body: Row) {
@@ -237,7 +286,7 @@ async function handle(request: Request) {
   if (!path.startsWith("/api")) path = `/api${path === "/" ? "/" : path}`;
   const method = request.method.toUpperCase();
 
-  if (method === "GET" && path === "/api/") return json(request, { service: "Market Masters Supabase API", ok: true, database: "supabase" });
+  if (method === "GET" && path === "/api/") return publicJson(request, { service: "Market Masters Supabase API", ok: true, database: "supabase" });
 
   if (method === "POST" && path === "/api/auth/register-team") {
     const body = await readBody(request);
@@ -277,7 +326,7 @@ async function handle(request: Request) {
     return json(request, { ok: true });
   }
 
-  if (method === "GET" && path === "/api/event/config") return json(request, await config());
+  if (method === "GET" && path === "/api/event/config") return publicJson(request, await config());
 
   if (method === "PUT" && path === "/api/event/config") {
     const user = await adminUser(request);
@@ -288,6 +337,8 @@ async function handle(request: Request) {
     if (Object.keys(update).length) {
       const { error } = await db.from("event_config").update(update).eq("id", "event");
       if (error) throw new ApiError(500, error.message);
+      invalidateConfigCache();
+      invalidateLeaderboardCache();
     }
     await audit("config_update", user, update);
     return json(request, await config());
@@ -304,7 +355,7 @@ async function handle(request: Request) {
     if (state === "ACTIVE" && !value.started_at) value.started_at = new Date().toISOString();
     if (state === "COMPLETED") value.ended_at ||= new Date().toISOString(); rounds[key] = value;
     const { error } = await db.from("event_config").update({ rounds }).eq("id", "event");
-    if (error) throw new ApiError(500, error.message); await audit(`round${round}_state_change`, user, { state }); return json(request, value);
+    if (error) throw new ApiError(500, error.message); invalidateConfigCache(); await audit(`round${round}_state_change`, user, { state }); return json(request, value);
   }
 
   if (method === "GET" && path === "/api/questions") {
@@ -325,7 +376,7 @@ async function handle(request: Request) {
     const question = await one("questions", { id: questionIdValue, round }); if (!question) throw new ApiError(404, "Question not found");
     const answer = requiredString(body.answer, "answer").toUpperCase(); const timeTaken = Number(body.time_taken); if (!Number.isFinite(timeTaken) || timeTaken < 0) throw new ApiError(422, "time_taken must be non-negative");
     const speedFactor = Math.max(0, 1 - timeTaken / Math.max(1, Number(question.time_limit))); const correct = answer === String(question.correct_answer).toUpperCase(); const score = correct ? Math.round(Number(question.base_points) * (1 + Number(cfg.speed_bonus_pct) * speedFactor)) : 0;
-    const row = await insert("submissions", { team_id: user.profile.team_id, question_id: questionIdValue, round, answer, correct, time_taken: timeTaken, score }); await audit(`round${round}_submit`, user, { question_id: questionIdValue, score }); return json(request, { correct, score, submission_id: row.id });
+    const row = await insert("submissions", { team_id: user.profile.team_id, question_id: questionIdValue, round, answer, correct, time_taken: timeTaken, score }); invalidateLeaderboardCache(); await audit(`round${round}_submit`, user, { question_id: questionIdValue, score }); return json(request, { correct, score, submission_id: row.id });
   }
 
   const mySubmissions = path.match(/^\/api\/rounds\/(\d+)\/my-submissions$/);
@@ -348,38 +399,38 @@ async function handle(request: Request) {
     if (resultType === "PROFIT" && (profit <= 0 || loss !== 0 || pl <= 0)) throw new ApiError(400, "Profit must be > 0, loss must be 0, and P/L % must be positive for PROFIT");
     if (resultType === "LOSS" && (loss <= 0 || profit !== 0 || pl >= 0)) throw new ApiError(400, "Loss must be > 0, profit must be 0, and P/L % must be negative for LOSS");
     if (!["PROFIT", "LOSS"].includes(resultType)) throw new ApiError(422, "Invalid result_type");
-    const tradeNumber = current.length ? Math.max(...current.map((t) => Number(t.trade_number))) + 1 : 1; const trade = await insert("trades", { team_id: user.profile.team_id, trade_number: tradeNumber, asset: requiredString(body.asset, "asset"), account_size: Number(body.account_size), risk_per_trade: risk, result_type: resultType, profit, loss, pl_percentage: pl, verification_status: "PENDING", admin_notes: null, proof_url: body.proof_url || null }); await audit("round3_trade_submit", user, { trade_number: tradeNumber, asset: trade.asset }); return json(request, trade);
+    const tradeNumber = current.length ? Math.max(...current.map((t) => Number(t.trade_number))) + 1 : 1; const trade = await insert("trades", { team_id: user.profile.team_id, trade_number: tradeNumber, asset: requiredString(body.asset, "asset"), account_size: Number(body.account_size), risk_per_trade: risk, result_type: resultType, profit, loss, pl_percentage: pl, verification_status: "PENDING", admin_notes: null, proof_url: body.proof_url || null }); invalidateLeaderboardCache(); await audit("round3_trade_submit", user, { trade_number: tradeNumber, asset: trade.asset }); return json(request, trade);
   }
   if (method === "POST" && path === "/api/rounds/3/close") { const user = await teamUser(request); await db.from("round3_sessions").update({ closed: true }).eq("team_id", user.profile.team_id); await audit("round3_close", user); return json(request, { ok: true }); }
 
-  if (method === "GET" && path === "/api/leaderboard") { const cfg = await config(); if (!cfg.leaderboard_visible) return json(request, { visible: false, rows: [] }); return json(request, { visible: true, rows: await scores() }); }
+  if (method === "GET" && path === "/api/leaderboard") { const cfg = await config(); if (!cfg.leaderboard_visible) return publicJson(request, { visible: false, rows: [] }); return publicJson(request, { visible: true, rows: await scores() }); }
   if (method === "GET" && path === "/api/scores/me") { const user = await teamUser(request); const row = (await scores()).find((item) => item.team_id === user.profile.team_id); return json(request, row || { rank: null, total: 0 }); }
 
   const verifyPath = path.match(/^\/api\/admin\/trades\/([^/]+)\/verify$/);
-  if (method === "POST" && verifyPath) { const user = await adminUser(request); const body = await readBody(request); const status = requiredString(body.status, "status").toUpperCase(); if (!["VERIFIED", "REJECTED"].includes(status) || (status === "REJECTED" && !body.reason)) throw new ApiError(400, "Valid status and rejection reason are required"); const { data, error } = await db.from("trades").update({ verification_status: status, admin_notes: body.reason || null }).eq("id", verifyPath[1]).select().maybeSingle(); if (error) throw new ApiError(500, error.message); if (!data) throw new ApiError(404, "Trade not found"); await audit("trade_verify", user, { trade_id: verifyPath[1], status }); return json(request, data); }
+  if (method === "POST" && verifyPath) { const user = await adminUser(request); const body = await readBody(request); const status = requiredString(body.status, "status").toUpperCase(); if (!["VERIFIED", "REJECTED"].includes(status) || (status === "REJECTED" && !body.reason)) throw new ApiError(400, "Valid status and rejection reason are required"); const { data, error } = await db.from("trades").update({ verification_status: status, admin_notes: body.reason || null }).eq("id", verifyPath[1]).select().maybeSingle(); if (error) throw new ApiError(500, error.message); if (!data) throw new ApiError(404, "Trade not found"); invalidateLeaderboardCache(); await audit("trade_verify", user, { trade_id: verifyPath[1], status }); return json(request, data); }
   if (method === "GET" && path === "/api/admin/trades") { await adminUser(request); const status = url.searchParams.get("status"); const trades = await all("trades", status ? { verification_status: status.toUpperCase() } : {}, ["submitted_at", false]); const teams = await all("teams"); const names = new Map(teams.map((team) => [team.id, team.team_name])); return json(request, trades.map((trade) => ({ ...trade, team_name: names.get(trade.team_id) || "Unknown" }))); }
   if (method === "GET" && path === "/api/admin/teams") { await adminUser(request); return json(request, await all("teams", {}, ["created_at", false])); }
 
-  if (method === "POST" && path === "/api/admin/score-override") { const user = await adminUser(request); const body = await readBody(request); const values = { team_id: requiredString(body.team_id, "team_id"), round: Number(body.round), new_score: Number(body.new_score), reason: requiredString(body.reason, "reason"), updated_at: new Date().toISOString() }; const { error } = await db.from("score_overrides").upsert(values); if (error) throw new ApiError(500, error.message); await audit("score_override", user, values); return json(request, { ok: true }); }
+  if (method === "POST" && path === "/api/admin/score-override") { const user = await adminUser(request); const body = await readBody(request); const values = { team_id: requiredString(body.team_id, "team_id"), round: Number(body.round), new_score: Number(body.new_score), reason: requiredString(body.reason, "reason"), updated_at: new Date().toISOString() }; const { error } = await db.from("score_overrides").upsert(values); if (error) throw new ApiError(500, error.message); invalidateLeaderboardCache(); await audit("score_override", user, values); return json(request, { ok: true }); }
 
   const deleteTeamPath = path.match(/^\/api\/admin\/teams\/([^/]+)$/);
-  if (method === "DELETE" && deleteTeamPath) { const user = await adminUser(request); const team = await one("teams", { id: deleteTeamPath[1] }); if (!team) throw new ApiError(404, "Team not found"); for (const table of ["submissions", "trades", "round3_sessions", "score_overrides", "leaderboard_snapshot"]) await db.from(table).delete().eq("team_id", deleteTeamPath[1]); await db.from("teams").delete().eq("id", deleteTeamPath[1]); await db.auth.admin.deleteUser(team.owner_user_id); await audit("team_delete", user, { team_id: team.id, team_name: team.team_name }); return json(request, { ok: true }); }
+  if (method === "DELETE" && deleteTeamPath) { const user = await adminUser(request); const team = await one("teams", { id: deleteTeamPath[1] }); if (!team) throw new ApiError(404, "Team not found"); for (const table of ["submissions", "trades", "round3_sessions", "score_overrides", "leaderboard_snapshot"]) await db.from(table).delete().eq("team_id", deleteTeamPath[1]); await db.from("teams").delete().eq("id", deleteTeamPath[1]); await db.auth.admin.deleteUser(team.owner_user_id); invalidateLeaderboardCache(); await audit("team_delete", user, { team_id: team.id, team_name: team.team_name }); return json(request, { ok: true }); }
   const deleteTradePath = path.match(/^\/api\/admin\/trades\/([^/]+)$/);
-  if (method === "DELETE" && deleteTradePath) { const user = await adminUser(request); const trade = await one("trades", { id: deleteTradePath[1] }); if (!trade) throw new ApiError(404, "Trade not found"); await db.from("trades").delete().eq("id", deleteTradePath[1]); await audit("trade_delete", user, { trade_id: trade.id, team_id: trade.team_id }); return json(request, { ok: true }); }
+  if (method === "DELETE" && deleteTradePath) { const user = await adminUser(request); const trade = await one("trades", { id: deleteTradePath[1] }); if (!trade) throw new ApiError(404, "Trade not found"); await db.from("trades").delete().eq("id", deleteTradePath[1]); invalidateLeaderboardCache(); await audit("trade_delete", user, { trade_id: trade.id, team_id: trade.team_id }); return json(request, { ok: true }); }
 
   if (method === "POST" && path === "/api/admin/event/action") {
     const user = await adminUser(request); const action = requiredString((await readBody(request)).action, "action"); if (!["start", "stop", "reset"].includes(action)) throw new ApiError(400, "action must be start | stop | reset"); const cfg = await config(); const rounds = structuredClone(cfg.rounds || DEFAULT_CONFIG.rounds);
     if (action === "start") { for (const key of ["1", "2", "3"]) rounds[key] = { state: "UPCOMING", started_at: null, ended_at: null }; await db.from("event_config").update({ registration_open: true, leaderboard_visible: true, rounds }).eq("id", "event"); }
     if (action === "stop") { const now = new Date().toISOString(); for (const key of ["1", "2", "3"]) { rounds[key].state = "COMPLETED"; rounds[key].ended_at ||= now; } await db.from("event_config").update({ registration_open: false, rounds }).eq("id", "event"); }
     if (action === "reset") { for (const table of ["submissions", "trades", "round3_sessions", "score_overrides", "leaderboard_snapshot"]) await db.from(table).delete().not("team_id", "is", null); for (const key of ["1", "2", "3"]) rounds[key] = { state: "UPCOMING", started_at: null, ended_at: null }; await db.from("event_config").update({ rounds }).eq("id", "event"); }
-    await audit(`event_${action}`, user); return json(request, await config());
+    invalidateConfigCache(); invalidateLeaderboardCache(); await audit(`event_${action}`, user); return json(request, await config());
   }
 
-  if (method === "GET" && path === "/api/announcements") return json(request, await all("announcements", {}, ["created_at", false]));
+  if (method === "GET" && path === "/api/announcements") return publicJson(request, await all("announcements", {}, ["created_at", false]));
   if (method === "POST" && path === "/api/announcements") { const user = await adminUser(request); const message = requiredString((await readBody(request)).message, "message"); const row = await insert("announcements", { message }); await audit("announcement", user, { message }); return json(request, row); }
   if (method === "GET" && path === "/api/admin/audit-logs") { await adminUser(request); return json(request, (await all("audit_logs", {}, ["timestamp", false])).slice(0, 200)); }
   if (method === "GET" && path === "/api/admin/analytics") {
-    await adminUser(request); const [teams, r1, r2, trades, sessions, rows] = await Promise.all([all("teams"), all("submissions", { round: 1 }), all("submissions", { round: 2 }), all("trades"), all("round3_sessions", { closed: false }), scores()]); const valid = trades.filter((trade) => trade.verification_status !== "REJECTED"); const returns = valid.map((trade) => Number(trade.pl_percentage || 0)); return json(request, { total_teams: teams.length, r1_submissions: r1.length, r2_submissions: r2.length, trades_total: trades.length, trade_1: trades.filter((t) => t.trade_number === 1).length, trade_2: trades.filter((t) => t.trade_number === 2).length, pending_verification: trades.filter((t) => t.verification_status === "PENDING").length, verified: trades.filter((t) => t.verification_status === "VERIFIED").length, rejected: trades.filter((t) => t.verification_status === "REJECTED").length, active_round3_sessions: sessions.length, avg_return_pct: returns.length ? Number((returns.reduce((a, b) => a + b, 0) / returns.length).toFixed(2)) : 0, best_return_pct: returns.length ? Math.max(...returns) : 0, best_risk_score: Math.max(0, ...rows.map((row) => row.risk_score)) });
+    await adminUser(request); const [teams, r1, r2, trades, sessions, rows] = await Promise.all([all("teams"), all("submissions", { round: 1 }), all("submissions", { round: 2 }), all("trades"), all("round3_sessions", { closed: false }), scores()]); await persistLeaderboardSnapshot(rows); const valid = trades.filter((trade) => trade.verification_status !== "REJECTED"); const returns = valid.map((trade) => Number(trade.pl_percentage || 0)); return json(request, { total_teams: teams.length, r1_submissions: r1.length, r2_submissions: r2.length, trades_total: trades.length, trade_1: trades.filter((t) => t.trade_number === 1).length, trade_2: trades.filter((t) => t.trade_number === 2).length, pending_verification: trades.filter((t) => t.verification_status === "PENDING").length, verified: trades.filter((t) => t.verification_status === "VERIFIED").length, rejected: trades.filter((t) => t.verification_status === "REJECTED").length, active_round3_sessions: sessions.length, avg_return_pct: returns.length ? Number((returns.reduce((a, b) => a + b, 0) / returns.length).toFixed(2)) : 0, best_return_pct: returns.length ? Math.max(...returns) : 0, best_risk_score: Math.max(0, ...rows.map((row) => row.risk_score)) });
   }
 
   const exportPath = path.match(/^\/api\/admin\/export\/(teams|round1|round2|round3|leaderboard)$/);
