@@ -4,7 +4,7 @@ Market Masters is a three-round trading competition platform built with React an
 
 ## Supabase setup
 
-The existing project already has the legacy compatibility migrations applied. The native schema is defined in `supabase/migrations/202610250003_market_masters_native.sql` and the deployed function is `supabase/functions/market-api/index.ts`.
+The Supabase project is `qpdepehmplravgxagogt`. The native schema is defined in `supabase/migrations/202610250003_market_masters_native.sql` and the backend is the `market-api` Edge Function in `supabase/functions/market-api/index.ts`.
 
 The function uses Supabase's server-side service key internally. It is never sent to the browser. The browser only receives the publishable key.
 
@@ -16,12 +16,12 @@ For the first administrator:
 
 ## Local frontend
 
-Create `frontend/.env.local` from `frontend/.env.example`:
+Create `frontend/.env.local` from `frontend/.env.example`. The project URL and function URL are already filled in; replace only the publishable key with the browser-safe key from Supabase Dashboard → Project Settings → API:
 
 ```env
-REACT_APP_SUPABASE_URL=https://YOUR_PROJECT_REF.supabase.co
+REACT_APP_SUPABASE_URL=https://qpdepehmplravgxagogt.supabase.co
 REACT_APP_SUPABASE_PUBLISHABLE_KEY=sb_publishable_replace_me
-REACT_APP_SUPABASE_FUNCTIONS_URL=https://YOUR_PROJECT_REF.supabase.co/functions/v1/market-api
+REACT_APP_SUPABASE_FUNCTIONS_URL=https://qpdepehmplravgxagogt.supabase.co/functions/v1/market-api
 ```
 
 Then run:
@@ -35,14 +35,16 @@ corepack yarn start
 The frontend runs at `http://localhost:3000`. The Supabase API health endpoint is:
 
 ```text
-https://YOUR_PROJECT_REF.supabase.co/functions/v1/market-api/api/
+https://qpdepehmplravgxagogt.supabase.co/functions/v1/market-api/api/
 ```
 
 ## Deployment
 
 Deploy the `frontend` directory to Vercel with the three `REACT_APP_SUPABASE_*` variables above. No Render, Railway, MongoDB, private database URL, JWT secret, or Supabase personal access token is required at runtime.
 
-Deploy updates to `supabase/functions/market-api/index.ts` through the Supabase Edge Function deployment workflow. Keep `SUPABASE_SERVICE_ROLE_KEY` inside Supabase Function secrets only.
+Deploy updates to `supabase/functions/market-api/index.ts` through the Supabase Edge Function deployment workflow. For local function work, copy `supabase/functions/.env.example` to a local env file and provide the service-role key only through the local CLI. Keep `SUPABASE_SERVICE_ROLE_KEY` inside Supabase Function secrets only.
+
+The old Python/MongoDB backend is intentionally no longer part of the deployment. Supabase Postgres, Auth, RLS policies, and the `market-api` Edge Function are the backend. Do not deploy `backend/` to Render or Railway.
 
 ## Validation
 
