@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Nav from "@/components/Nav";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -10,6 +10,7 @@ export default function Round2() {
   const [subs, setSubs] = useState([]);
   const [tLeft, setTLeft] = useState(45);
   const startRef = useRef(Date.now());
+  const submittedRef = useRef(false);
   const [loading, setLoading] = useState(false);
 
   const [qsLoaded, setLoaded] = useState(false);
@@ -25,7 +26,13 @@ export default function Round2() {
   }, []);
 
   const cur = qs[idx];
-  useEffect(() => { if (cur) { startRef.current = Date.now(); setTLeft(cur.time_limit); } }, [cur]);
+  useEffect(() => {
+    if (cur) {
+      startRef.current = Date.now();
+      submittedRef.current = false;
+      setTLeft(cur.time_limit);
+    }
+  }, [cur]);
   useEffect(() => {
     if (!cur) return;
     const t = setInterval(() => setTLeft((v) => Math.max(0, v - 1)), 1000);
@@ -34,8 +41,9 @@ export default function Round2() {
 
   const totalScore = useMemo(() => subs.reduce((a, s) => a + (s.score || 0), 0), [subs]);
 
-  const submit = async (answer) => {
-    if (!cur || loading) return;
+  const submit = useCallback(async (answer) => {
+    if (!cur || loading || submittedRef.current) return;
+    submittedRef.current = true;
     setLoading(true);
     const time_taken = (Date.now() - startRef.current) / 1000;
     try {
@@ -45,7 +53,11 @@ export default function Round2() {
       setTimeout(() => setIdx((i) => i + 1), 650);
     } catch (e) { toast.error(formatApiError(e)); }
     finally { setLoading(false); }
-  };
+  }, [cur, loading]);
+
+  useEffect(() => {
+    if (cur && tLeft === 0 && !submittedRef.current) submit("");
+  }, [cur, tLeft, submit]);
 
   if (!qsLoaded) return <Shell><div className="font-mono text-sm text-mm-text2">Loading…</div></Shell>;
   if (qs.length === 0) return (

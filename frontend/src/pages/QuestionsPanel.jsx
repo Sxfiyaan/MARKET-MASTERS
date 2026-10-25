@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 
@@ -11,11 +11,11 @@ export default function QuestionsPanel({ initialRound = 1 }) {
   const [form, setForm] = useState(initialRound === 1 ? emptyR1() : emptyR2());
   const [editingId, setEditingId] = useState(null);
 
-  const load = async (r = round) => {
+  const load = useCallback(async (r = round) => {
     try { const { data } = await api.get("/questions", { params: { round: r } }); setQs(data); }
     catch (e) { toast.error(formatApiError(e)); }
-  };
-  useEffect(() => { load(round); setForm(round === 1 ? emptyR1() : emptyR2()); setEditingId(null); /* eslint-disable-next-line */ }, [round]);
+  }, [round]);
+  useEffect(() => { load(round); setForm(round === 1 ? emptyR1() : emptyR2()); setEditingId(null); }, [load, round]);
 
   const save = async (e) => {
     e.preventDefault();

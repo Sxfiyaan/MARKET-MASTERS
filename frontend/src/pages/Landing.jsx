@@ -2,7 +2,7 @@ import React from "react";
 import { Link } from "react-router-dom";
 import Nav from "@/components/Nav";
 import Ticker from "@/components/Ticker";
-import CandlestickBG from "@/components/CandlestickBG";
+import CandlestickBG from "@/components/candlestickBG";
 
 const Stat = ({ label, value, trend, tid }) => (
   <div className="mm-panel mm-corner-ticks p-5" data-testid={tid}>

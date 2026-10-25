@@ -3,6 +3,15 @@ import { api, formatApiError } from "@/lib/api";
 
 const AuthContext = createContext(null);
 
+async function hydrateUser(fallbackUser) {
+  try {
+    const { data } = await api.get("/auth/me");
+    return data;
+  } catch {
+    return fallbackUser;
+  }
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -25,8 +34,9 @@ export function AuthProvider({ children }) {
     try {
       const { data } = await api.post("/auth/login", { email, password });
       localStorage.setItem("mm_token", data.token);
-      setUser(data.user);
-      return { ok: true, user: data.user };
+      const user = await hydrateUser(data.user);
+      setUser(user);
+      return { ok: true, user };
     } catch (e) {
       return { ok: false, error: formatApiError(e) };
     }
@@ -36,8 +46,9 @@ export function AuthProvider({ children }) {
     try {
       const { data } = await api.post("/auth/register-team", payload);
       localStorage.setItem("mm_token", data.token);
-      setUser(data.user);
-      return { ok: true, user: data.user };
+      const user = await hydrateUser(data.user);
+      setUser(user);
+      return { ok: true, user };
     } catch (e) {
       return { ok: false, error: formatApiError(e) };
     }

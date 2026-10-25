@@ -11,7 +11,7 @@ import Round1 from "@/pages/Round1";
 import Round2 from "@/pages/Round2";
 import Round3 from "@/pages/Round3";
 import Leaderboard from "@/pages/Leaderboard";
-import Results from "@/pages/Results";
+import Results from "@/pages/Result";
 import Admin from "@/pages/Admin";
 
 const Protected = ({ children, role }) => {

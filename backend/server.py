@@ -8,24 +8,31 @@ import io
 import csv
 import uuid
 import logging
-import secrets
 import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional, Literal, Any
+from typing import List, Optional, Literal
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Query
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator
+from db import PostgresDatabase
+from mongo_db import MongoDatabase
 
 # -----------------------------------------------------------------------------
 # DB + App
 # -----------------------------------------------------------------------------
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+database_url = os.environ.get("SUPABASE_DB_URL") or os.environ.get("DATABASE_URL")
+mongo_url = os.environ.get("MONGO_URL")
+if database_url:
+    db = PostgresDatabase(database_url)
+    database_backend = "supabase-postgres"
+elif mongo_url:
+    db = MongoDatabase(mongo_url, os.environ.get("DB_NAME", "market_masters"))
+    database_backend = "mongodb"
+else:
+    raise RuntimeError("Configure SUPABASE_DB_URL/DATABASE_URL or MONGO_URL")
 
 app = FastAPI(title="Market Masters API")
 api = APIRouter(prefix="/api")
@@ -139,7 +146,7 @@ class QuestionOut(QuestionIn):
 class SubmitAnswerIn(BaseModel):
     question_id: str
     answer: str
-    time_taken: float  # seconds
+    time_taken: float = Field(..., ge=0)  # seconds
 
 class TradeIn(BaseModel):
     asset: str
@@ -223,6 +230,7 @@ SAMPLE_R2 = []
 
 @app.on_event("startup")
 async def startup():
+    await db.connect()
     # Indexes
     await db.users.create_index("email", unique=True)
     await db.users.create_index("id", unique=True)
@@ -256,29 +264,30 @@ async def startup():
 
     # Admin seeding only (no questions seeded; organizer adds them via admin UI)
 
-    # Seed one demo team for testing
-    demo_email = "alpha@team.com"
-    if not await db.users.find_one({"email": demo_email}):
-        uid = str(uuid.uuid4())
-        tid = str(uuid.uuid4())
-        await db.users.insert_one({
-            "id": uid, "email": demo_email, "name": "Alpha Lead",
-            "password_hash": hash_password("Team@12345"),
-            "role": "team", "team_id": tid, "created_at": iso(now_utc()),
-        })
-        await db.teams.insert_one({
-            "id": tid, "team_name": "Alpha Traders", "leader_name": "Alpha Lead",
-            "leader_email": demo_email, "leader_phone": "9999999999",
-            "college": "IIM Example", "members": ["Member Two", "Member Three"],
-            "owner_user_id": uid, "created_at": iso(now_utc()),
-        })
+    if os.environ.get("SEED_DEMO_DATA", "false").lower() == "true":
+        demo_email = os.environ.get("DEMO_EMAIL", "alpha@team.com").lower()
+        demo_password = os.environ["DEMO_PASSWORD"]
+        if not await db.users.find_one({"email": demo_email}):
+            uid = str(uuid.uuid4())
+            tid = str(uuid.uuid4())
+            await db.users.insert_one({
+                "id": uid, "email": demo_email, "name": "Alpha Lead",
+                "password_hash": hash_password(demo_password),
+                "role": "team", "team_id": tid, "created_at": iso(now_utc()),
+            })
+            await db.teams.insert_one({
+                "id": tid, "team_name": "Alpha Traders", "leader_name": "Alpha Lead",
+                "leader_email": demo_email, "leader_phone": "9999999999",
+                "college": "IIM Example", "members": ["Member Two", "Member Three"],
+                "owner_user_id": uid, "created_at": iso(now_utc()),
+            })
 
 # -----------------------------------------------------------------------------
 # Health
 # -----------------------------------------------------------------------------
 @api.get("/")
 async def root():
-    return {"service": "Market Masters API", "ok": True}
+    return {"service": "Market Masters API", "ok": True, "database": database_backend}
 
 # -----------------------------------------------------------------------------
 # Auth
@@ -389,7 +398,9 @@ async def create_question(body: QuestionIn, admin: dict = Depends(require_admin)
 
 @api.put("/questions/{qid}")
 async def update_question(qid: str, body: QuestionIn, admin: dict = Depends(require_admin)):
-    await db.questions.update_one({"id": qid}, {"$set": body.model_dump()})
+    result = await db.questions.update_one({"id": qid}, {"$set": body.model_dump()})
+    if result.matched_count == 0:
+        raise HTTPException(404, "Question not found")
     doc = await db.questions.find_one({"id": qid})
     doc.pop("_id", None)
     await audit("question_update", admin, {"id": qid})
@@ -892,10 +903,15 @@ async def export(kind: str, _: dict = Depends(require_admin)):
 # -----------------------------------------------------------------------------
 app.include_router(api)
 
+cors_origins = [origin.strip() for origin in os.environ.get(
+    "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+).split(",") if origin.strip()]
+allow_credentials = "*" not in cors_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_credentials=allow_credentials,
+    allow_origins=cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -904,4 +920,4 @@ logging.basicConfig(level=logging.INFO)
 
 @app.on_event("shutdown")
 async def shutdown():
-    client.close()
+    await db.close()
