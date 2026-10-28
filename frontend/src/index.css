@@ -83,9 +83,42 @@ body {
 .mm-corner-ticks > .ct-tl, .mm-corner-ticks > .ct-br {
   content: ''; position: absolute; width: 10px; height: 10px;
   border-color: var(--mm-gold); border-style: solid;
+  pointer-events: none;
 }
 .mm-corner-ticks::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
 .mm-corner-ticks::after  { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+
+/* Explicit Decision Button Styles for Round 2 */
+.r2-decision-btn {
+  background: var(--mm-panel);
+  border: 1px solid var(--mm-border);
+  border-radius: 0.25rem;
+  transition: all 0.15s ease-in-out;
+  cursor: pointer;
+  position: relative;
+}
+.r2-decision-btn:hover:not(:disabled) {
+  background: var(--mm-panel-hover);
+  border-color: var(--mm-border-bright);
+}
+.r2-decision-btn:disabled {
+  cursor: not-allowed;
+}
+.r2-decision-btn.is-selected-buy {
+  background: rgba(0, 230, 118, 0.12) !important;
+  border-color: #00E676 !important;
+  box-shadow: 0 0 16px rgba(0, 230, 118, 0.25), inset 0 0 8px rgba(0, 230, 118, 0.08) !important;
+}
+.r2-decision-btn.is-selected-sell {
+  background: rgba(255, 59, 48, 0.12) !important;
+  border-color: #FF3B30 !important;
+  box-shadow: 0 0 16px rgba(255, 59, 48, 0.25), inset 0 0 8px rgba(255, 59, 48, 0.08) !important;
+}
+.r2-decision-btn.is-selected-notrade {
+  background: rgba(245, 158, 11, 0.12) !important;
+  border-color: #F59E0B !important;
+  box-shadow: 0 0 16px rgba(245, 158, 11, 0.25), inset 0 0 8px rgba(245, 158, 11, 0.08) !important;
+}
 
 .pulse-dot { animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.85)} }

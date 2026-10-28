@@ -88,13 +88,13 @@ begin
   where id = 'current'
   for share;
 
-  if v_state is null or v_state.is_paused or v_state.status <> 'ACTIVE' or v_state.phase <> 'QUESTION' then
+  if v_state.id is null or v_state.is_paused or v_state.status <> 'ACTIVE' or v_state.phase <> 'QUESTION' then
     return jsonb_build_object('ok', false, 'error', 'Question is not currently open', 'code', 'NOT_OPEN');
   end if;
 
   -- Verify event_config round 1 is active (Stop Event immediately rejects submissions)
   select * into v_event from public.event_config where id = 'event' for share;
-  if v_event is not null and (v_event.rounds->'1'->>'state') <> 'ACTIVE' then
+  if v_event.id is not null and (v_event.rounds->'1'->>'state') <> 'ACTIVE' then
     return jsonb_build_object('ok', false, 'error', 'Round 1 is not active', 'code', 'NOT_OPEN');
   end if;
 
@@ -141,7 +141,7 @@ begin
     from public.questions
     where id = p_question_id and round = 1;
 
-    if v_question is null then
+    if v_question.id is null then
       return jsonb_build_object('ok', false, 'error', 'Question not found', 'code', 'NOT_FOUND');
     end if;
 
@@ -213,14 +213,20 @@ declare
   v_limit integer;
   v_closed_ids uuid[];
   v_item jsonb;
+  v_cfg record;
 begin
-  -- Lock row exclusively
+  -- Lock round1_state exclusively first, then event_config exclusively
   select * into v_state
   from public.round1_state
   where id = 'current'
   for update;
 
-  if v_state is null then
+  select * into v_cfg
+  from public.event_config
+  where id = 'event'
+  for update;
+
+  if v_state.id is null then
     return jsonb_build_object('ok', false, 'error', 'Round 1 state row not found', 'code', 'STATE_NOT_FOUND');
   end if;
 
@@ -363,12 +369,24 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_cfg record;
   v_state record;
+  v_cfg record;
   v_rounds jsonb;
 begin
-  select * into v_cfg from public.event_config where id = 'event' for update;
+  -- Consistent lock order: round1_state first, then event_config
   select * into v_state from public.round1_state where id = 'current' for update;
+  select * into v_cfg from public.event_config where id = 'event' for update;
+
+  if v_state.id is null then
+    return jsonb_build_object('ok', false, 'error', 'Round 1 state row not found', 'code', 'STATE_NOT_FOUND');
+  end if;
+
+  -- Advance any elapsed phases using authoritative database time first before stopping
+  if not v_state.is_paused and v_state.status in ('ACTIVE', 'COUNTDOWN') and v_state.phase_ends_at is not null and p_now >= v_state.phase_ends_at then
+    perform public.advance_round1_state_tx(p_now);
+    select * into v_state from public.round1_state where id = 'current' for update;
+    select * into v_cfg from public.event_config where id = 'event' for update;
+  end if;
 
   v_rounds := coalesce(v_cfg.rounds, '{}'::jsonb);
   v_rounds := jsonb_set(v_rounds, '{1}', jsonb_build_object('state', 'COMPLETED', 'started_at', v_rounds->'1'->>'started_at', 'ended_at', p_now));
@@ -406,15 +424,24 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_rounds jsonb;
   v_state record;
+  v_cfg record;
+  v_rounds jsonb;
+  v_q_count integer := 0;
 begin
+  -- Acquire locks FIRST before deleting records (consistent lock order: round1_state then event_config)
+  select * into v_state from public.round1_state where id = 'current' for update;
+  select * into v_cfg from public.event_config where id = 'event' for update;
+
   -- Delete all participant submissions, trades, sessions, overrides
   delete from public.submissions where team_id is not null;
   delete from public.trades where team_id is not null;
   delete from public.round3_sessions where team_id is not null;
   delete from public.score_overrides where team_id is not null;
   delete from public.leaderboard_snapshot where team_id is not null;
+
+  -- Determine actual configured question count for Round 1
+  select count(*) into v_q_count from public.questions where round = 1;
 
   v_rounds := jsonb_build_object(
     '1', jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null),
@@ -431,7 +458,7 @@ begin
       phase = 'WAITING',
       current_question_index = 0,
       current_question_id = null,
-      total_questions = 0,
+      total_questions = coalesce(v_q_count, 0),
       phase_start_at = null,
       phase_ends_at = null,
       is_paused = false,
@@ -446,6 +473,249 @@ begin
   returning * into v_state;
 
   return to_jsonb(v_state);
+end;
+$$;
+
+-- Atomic Start Event procedure: ensures R1 is not left running or reopened with old answers
+create or replace function public.admin_start_event_tx(
+  p_now timestamptz default clock_timestamp()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_state record;
+  v_cfg record;
+  v_rounds jsonb;
+begin
+  -- Consistent lock order: round1_state first, then event_config
+  select * into v_state from public.round1_state where id = 'current' for update;
+  select * into v_cfg from public.event_config where id = 'event' for update;
+
+  if v_state.id is not null and (v_state.status in ('ACTIVE', 'COUNTDOWN', 'PAUSED') or v_state.is_paused) then
+    return jsonb_build_object('ok', false, 'error', 'Cannot start event while Round 1 is active or paused. Stop or reset the event first.', 'code', 'R1_ACTIVE');
+  end if;
+
+  if exists (select 1 from public.submissions where round = 1 limit 1) then
+    return jsonb_build_object('ok', false, 'error', 'Cannot start event when a played round exists. Reset gameplay first.', 'code', 'ROUND_PLAYED');
+  end if;
+
+  v_rounds := coalesce(v_cfg.rounds, '{}'::jsonb);
+  v_rounds := jsonb_set(v_rounds, '{1}', jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null));
+  v_rounds := jsonb_set(v_rounds, '{2}', jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null));
+  v_rounds := jsonb_set(v_rounds, '{3}', jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null));
+
+  update public.event_config
+  set registration_open = true,
+      leaderboard_visible = true,
+      rounds = v_rounds
+  where id = 'event';
+
+  return jsonb_build_object('ok', true);
+end;
+$$;
+
+-- Atomic Round 1 State transition procedure: updates round1_state and event_config in a single transaction
+create or replace function public.admin_set_round1_state_tx(
+  p_action text, -- 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'UPCOMING'
+  p_now timestamptz default clock_timestamp(),
+  p_frozen_questions jsonb default null,
+  p_speed_bonus numeric default 0.5
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_state record;
+  v_cfg record;
+  v_rounds jsonb;
+  v_r1_round jsonb;
+  v_remaining_ms numeric;
+  v_new_ends timestamptz;
+  v_new_start timestamptz;
+  v_limit_sec integer;
+  v_first_item jsonb;
+begin
+  -- Lock round1_state first, then event_config
+  select * into v_state from public.round1_state where id = 'current' for update;
+  select * into v_cfg from public.event_config where id = 'event' for update;
+
+  if v_state.id is null then
+    return jsonb_build_object('ok', false, 'error', 'Round 1 state row not found', 'code', 'STATE_NOT_FOUND');
+  end if;
+
+  -- Advance any elapsed phases using authoritative database time first before changing state
+  if not v_state.is_paused and v_state.status in ('ACTIVE', 'COUNTDOWN') and v_state.phase_ends_at is not null and p_now >= v_state.phase_ends_at then
+    perform public.advance_round1_state_tx(p_now);
+    select * into v_state from public.round1_state where id = 'current' for update;
+    select * into v_cfg from public.event_config where id = 'event' for update;
+  end if;
+
+  v_rounds := coalesce(v_cfg.rounds, '{}'::jsonb);
+  v_r1_round := coalesce(v_rounds->'1', jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null));
+
+  if p_action = 'ACTIVE' then
+    if v_state.status = 'COMPLETED' or v_state.phase = 'COMPLETED' then
+      return jsonb_build_object('ok', false, 'error', 'Round 1 is completed. To start a new run, perform an explicit Reset Gameplay first.', 'code', 'ROUND_COMPLETED');
+    end if;
+
+    if v_state.status in ('ACTIVE', 'COUNTDOWN') and not v_state.is_paused then
+      -- Idempotent: already running
+      return jsonb_build_object('ok', true, 'state', to_jsonb(v_state), 'rounds', v_rounds, 'round_value', v_r1_round);
+    end if;
+
+    if v_state.is_paused then
+      -- Resume
+      v_remaining_ms := greatest(0::numeric, coalesce(v_state.paused_remaining_ms, 0));
+      if v_remaining_ms = 0 then
+        update public.round1_state
+        set is_paused = false,
+            paused_at = null,
+            paused_remaining_ms = 0,
+            pause_phase = null,
+            phase_ends_at = p_now,
+            status = case when v_state.pause_phase = 'COUNTDOWN' then 'COUNTDOWN' else 'ACTIVE' end,
+            version = version + 1,
+            updated_at = p_now
+        where id = 'current'
+        returning * into v_state;
+      else
+        v_new_ends := p_now + (v_remaining_ms * interval '1 millisecond');
+        v_new_start := v_state.phase_start_at;
+
+        if v_state.pause_phase = 'QUESTION' and v_state.current_question_id is not null then
+          v_limit_sec := 30;
+          if v_state.frozen_questions is not null then
+            for v_first_item in select * from jsonb_array_elements(v_state.frozen_questions) loop
+              if (v_first_item->>'id')::uuid = v_state.current_question_id then
+                v_limit_sec := coalesce((v_first_item->>'time_limit')::integer, 30);
+                exit;
+              end if;
+            end loop;
+          end if;
+          v_new_start := v_new_ends - (v_limit_sec * interval '1 second');
+        end if;
+
+        update public.round1_state
+        set is_paused = false,
+            paused_at = null,
+            paused_remaining_ms = 0,
+            pause_phase = null,
+            phase_start_at = v_new_start,
+            phase_ends_at = v_new_ends,
+            status = case when v_state.pause_phase = 'COUNTDOWN' then 'COUNTDOWN' else 'ACTIVE' end,
+            version = version + 1,
+            updated_at = p_now
+        where id = 'current'
+        returning * into v_state;
+      end if;
+    else
+      -- Fresh start
+      if p_frozen_questions is null or jsonb_array_length(p_frozen_questions) = 0 then
+        return jsonb_build_object('ok', false, 'error', 'No Round 1 questions configured', 'code', 'NO_QUESTIONS');
+      end if;
+
+      v_first_item := p_frozen_questions->0;
+      update public.round1_state
+      set status = 'COUNTDOWN',
+          phase = 'COUNTDOWN',
+          current_question_index = 0,
+          current_question_id = (v_first_item->>'id')::uuid,
+          total_questions = jsonb_array_length(p_frozen_questions),
+          phase_start_at = p_now,
+          phase_ends_at = p_now + interval '10 seconds',
+          is_paused = false,
+          paused_at = null,
+          paused_remaining_ms = 0,
+          pause_phase = null,
+          closed_question_ids = array[]::uuid[],
+          frozen_questions = p_frozen_questions,
+          speed_bonus_pct = coalesce(p_speed_bonus, 0.5),
+          version = version + 1,
+          updated_at = p_now
+      where id = 'current'
+      returning * into v_state;
+    end if;
+
+    v_r1_round := jsonb_set(v_r1_round, '{state}', '"ACTIVE"');
+    if v_r1_round->>'started_at' is null then
+      v_r1_round := jsonb_set(v_r1_round, '{started_at}', to_jsonb(to_char(p_now, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+    end if;
+
+  elsif p_action = 'PAUSED' then
+    if (v_state.status in ('ACTIVE', 'COUNTDOWN')) and not v_state.is_paused then
+      v_remaining_ms := greatest(0::numeric, extract(epoch from (v_state.phase_ends_at - p_now)) * 1000);
+      update public.round1_state
+      set is_paused = true,
+          paused_at = p_now,
+          pause_phase = v_state.phase,
+          paused_remaining_ms = v_remaining_ms,
+          status = 'PAUSED',
+          version = version + 1,
+          updated_at = p_now
+      where id = 'current'
+      returning * into v_state;
+    end if;
+
+    v_r1_round := jsonb_set(v_r1_round, '{state}', '"PAUSED"');
+
+  elsif p_action = 'COMPLETED' then
+    update public.round1_state
+    set status = 'COMPLETED',
+        phase = 'COMPLETED',
+        is_paused = false,
+        paused_remaining_ms = 0,
+        pause_phase = null,
+        current_question_id = null,
+        version = version + 1,
+        updated_at = p_now
+    where id = 'current'
+    returning * into v_state;
+
+    v_r1_round := jsonb_set(v_r1_round, '{state}', '"COMPLETED"');
+    if v_r1_round->>'ended_at' is null then
+      v_r1_round := jsonb_set(v_r1_round, '{ended_at}', to_jsonb(to_char(p_now, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')));
+    end if;
+
+  elsif p_action = 'UPCOMING' then
+    if v_state.status = 'COMPLETED' or coalesce(array_length(v_state.closed_question_ids, 1), 0) > 0 then
+      return jsonb_build_object('ok', false, 'error', 'Cannot return a played or completed round to UPCOMING. Perform an explicit Reset Gameplay first.', 'code', 'ROUND_PLAYED');
+    end if;
+
+    if exists (select 1 from public.submissions where round = 1 limit 1) then
+      return jsonb_build_object('ok', false, 'error', 'Cannot return a played round with existing submissions to UPCOMING. Perform an explicit Reset Gameplay first.', 'code', 'ROUND_PLAYED');
+    end if;
+
+    update public.round1_state
+    set status = 'IDLE',
+        phase = 'WAITING',
+        current_question_index = 0,
+        current_question_id = null,
+        is_paused = false,
+        paused_remaining_ms = 0,
+        pause_phase = null,
+        closed_question_ids = array[]::uuid[],
+        frozen_questions = null,
+        version = version + 1,
+        updated_at = p_now
+    where id = 'current'
+    returning * into v_state;
+
+    v_r1_round := jsonb_build_object('state', 'UPCOMING', 'started_at', null, 'ended_at', null);
+  else
+    return jsonb_build_object('ok', false, 'error', 'Invalid action', 'code', 'INVALID_ACTION');
+  end if;
+
+  v_rounds := jsonb_set(v_rounds, '{1}', v_r1_round);
+  update public.event_config
+  set rounds = v_rounds
+  where id = 'event';
+
+  return jsonb_build_object('ok', true, 'state', to_jsonb(v_state), 'rounds', v_rounds, 'round_value', v_r1_round);
 end;
 $$;
 
@@ -470,5 +740,15 @@ revoke all on function public.admin_reset_gameplay_tx(timestamptz) from public;
 revoke all on function public.admin_reset_gameplay_tx(timestamptz) from anon;
 revoke all on function public.admin_reset_gameplay_tx(timestamptz) from authenticated;
 grant execute on function public.admin_reset_gameplay_tx(timestamptz) to service_role;
+
+revoke all on function public.admin_start_event_tx(timestamptz) from public;
+revoke all on function public.admin_start_event_tx(timestamptz) from anon;
+revoke all on function public.admin_start_event_tx(timestamptz) from authenticated;
+grant execute on function public.admin_start_event_tx(timestamptz) to service_role;
+
+revoke all on function public.admin_set_round1_state_tx(text, timestamptz, jsonb, numeric) from public;
+revoke all on function public.admin_set_round1_state_tx(text, timestamptz, jsonb, numeric) from anon;
+revoke all on function public.admin_set_round1_state_tx(text, timestamptz, jsonb, numeric) from authenticated;
+grant execute on function public.admin_set_round1_state_tx(text, timestamptz, jsonb, numeric) to service_role;
 
 commit;

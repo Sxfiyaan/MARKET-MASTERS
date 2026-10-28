@@ -4,12 +4,32 @@ import { supabase } from "@/lib/supabase";
 const FUNCTIONS_URL = (process.env.REACT_APP_SUPABASE_FUNCTIONS_URL || `${process.env.REACT_APP_SUPABASE_URL}/functions/v1/market-api`).replace(/\/$/, "");
 export const API_BASE = `${FUNCTIONS_URL}/api`;
 
-const http = axios.create({ baseURL: API_BASE });
+export const http = axios.create({ baseURL: API_BASE });
 
 http.interceptors.request.use(async (cfg) => {
+  const key = process.env.REACT_APP_SUPABASE_PUBLISHABLE_KEY;
+  if (key) {
+    cfg.headers = cfg.headers || {};
+    cfg.headers.apikey = key;
+  }
+
+  // Public registration: adhere to Supabase contract by sending only apikey and stripping stale Authorization
+  const isPublicAuth = cfg.url === "/auth/register-team" || cfg.url?.endsWith("/auth/register-team");
+  if (isPublicAuth) {
+    if (cfg.headers) {
+      delete cfg.headers.Authorization;
+      delete cfg.headers.authorization;
+    }
+    return cfg;
+  }
+
   const { data } = await supabase.auth.getSession();
   const token = data.session?.access_token;
-  if (token) cfg.headers.Authorization = `Bearer ${token}`;
+  if (token) {
+    cfg.headers.Authorization = `Bearer ${token}`;
+  } else {
+    delete cfg.headers.Authorization;
+  }
   return cfg;
 });
 

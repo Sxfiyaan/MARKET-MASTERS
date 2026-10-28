@@ -1,6 +1,13 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Nav from "@/components/Nav";
 import { api, formatApiError } from "@/lib/api";
+import {
+  calculateDisplaySeconds,
+  handleDeadlineRetry,
+  processStatusResponse,
+  applyAnswerConfirmation,
+  handleSubmissionFailure,
+} from "@/lib/round1Sync";
 import { toast } from "sonner";
 import { Link } from "react-router-dom";
 
@@ -21,63 +28,71 @@ export default function Round1() {
   const retryCountRef = useRef(0);
   const retryTimerRef = useRef(null);
 
+  // Estimated server time offset (server_time ≈ client_recv - RTT/2; an estimate, not a millisecond guarantee)
   const serverTimeOffsetRef = useRef(0);
   const statusRequestIdRef = useRef(0);
+  const inFlightPromiseRef = useRef(null);
+  const inFlightIsDeadlineRef = useRef(false);
 
-  // Fetch status from server with overlapping response protection
+  // Fetch status from server with overlapping response protection, coalescing, and latency compensation
   const fetchStatus = useCallback(async (isDeadlineTrigger = false) => {
-    const reqId = ++statusRequestIdRef.current;
-    try {
-      const { data } = await api.get("/rounds/1/status");
-
-      // Discard older overlapping responses that resolved out of order
-      if (reqId !== statusRequestIdRef.current) {
-        return null;
+    // Coalesce duplicate focus/visibility/poll requests while a refresh is already running.
+    // Preserve scheduled deadline requests: do not swallow a boundary refresh into a pre-deadline request!
+    if (inFlightPromiseRef.current) {
+      if (!isDeadlineTrigger || inFlightIsDeadlineRef.current) {
+        return inFlightPromiseRef.current;
       }
-
-      const prev = statusRef.current;
-
-      // Discard backward server-time jumps
-      if (prev?.server_time && data?.server_time) {
-        if (new Date(data.server_time).getTime() < new Date(prev.server_time).getTime()) {
-          return prev;
-        }
-      }
-
-      setStatus(data);
-      setLoading(false);
-
-      if (data?.server_time) {
-        const serverTimeMs = new Date(data.server_time).getTime();
-        serverTimeOffsetRef.current = serverTimeMs - Date.now();
-      }
-
-      // Check if phase changed or question advanced
-      const phaseChanged = !prev || prev.phase !== data.phase || prev.question_index !== data.question_index;
-
-      if (phaseChanged) {
-        deadlineRequestedRef.current = false;
-        retryCountRef.current = 0;
-        if (retryTimerRef.current) {
-          clearTimeout(retryTimerRef.current);
-          retryTimerRef.current = null;
-        }
-        setPendingChoice(null);
-      } else if (isDeadlineTrigger) {
-        // If deadline was triggered but phase hasn't transitioned yet (clock skew), bounded retry
-        if (retryCountRef.current < 4) {
-          retryCountRef.current += 1;
-          const delay = retryCountRef.current * 700;
-          retryTimerRef.current = setTimeout(() => {
-            fetchStatus(true);
-          }, delay);
-        }
-      }
-      return data;
-    } catch (e) {
-      setLoading(false);
-      return null;
     }
+
+    const reqId = ++statusRequestIdRef.current;
+    const reqStartTime = Date.now();
+    inFlightIsDeadlineRef.current = Boolean(isDeadlineTrigger);
+
+    const task = (async () => {
+      try {
+        const { data } = await api.get("/rounds/1/status");
+
+        const processed = processStatusResponse(data, statusRef.current, reqId, statusRequestIdRef.current, reqStartTime);
+        if (!processed.accept) {
+          return processed.reason === "CLOCK_REGRESSION" ? statusRef.current : null;
+        }
+
+        setStatus(processed.data);
+        setLoading(false);
+        serverTimeOffsetRef.current = processed.serverTimeOffset;
+
+        if (processed.phaseChanged) {
+          deadlineRequestedRef.current = false;
+          retryCountRef.current = 0;
+          if (retryTimerRef.current) {
+            clearTimeout(retryTimerRef.current);
+            retryTimerRef.current = null;
+          }
+          setPendingChoice(null);
+        } else if (isDeadlineTrigger) {
+          // If deadline was triggered but phase hasn't transitioned yet (clock skew), bounded retry
+          const retry = handleDeadlineRetry(retryCountRef.current);
+          if (retry.canRetry) {
+            retryCountRef.current = retry.nextRetryCount;
+            retryTimerRef.current = setTimeout(() => {
+              fetchStatus(true);
+            }, retry.delayMs);
+          }
+        }
+        return processed.data;
+      } catch (e) {
+        setLoading(false);
+        return null;
+      } finally {
+        if (inFlightPromiseRef.current === task) {
+          inFlightPromiseRef.current = null;
+          inFlightIsDeadlineRef.current = false;
+        }
+      }
+    })();
+
+    inFlightPromiseRef.current = task;
+    return task;
   }, []);
 
   // Initial load
@@ -90,7 +105,23 @@ export default function Round1() {
     const backupInterval = setInterval(() => {
       fetchStatus(false);
     }, 3500);
-    return () => clearInterval(backupInterval);
+
+    // Immediate recovery when window or tab gains focus or visibility
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        fetchStatus(false);
+      }
+    };
+    const onFocus = () => fetchStatus(false);
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      clearInterval(backupInterval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [fetchStatus]);
 
   // Cleanup any pending retry timeouts
@@ -106,24 +137,20 @@ export default function Round1() {
 
   // Sync display timer with status ends_at or frozen paused time using server-skew corrected clock
   useEffect(() => {
-    if (!phaseEndsAt && !isPaused) {
-      setDisplayTime(0);
-      return;
-    }
-
-    if (isPaused) {
-      setDisplayTime(statusTimeLeft ?? 0);
-      return;
-    }
-
-    const calcRemaining = () => {
-      const endsAtMs = new Date(phaseEndsAt).getTime();
-      const estimatedServerNow = Date.now() + (serverTimeOffsetRef.current || 0);
-      return Math.max(0, Math.ceil((endsAtMs - estimatedServerNow) / 1000));
-    };
+    const calcRemaining = () =>
+      calculateDisplaySeconds(
+        phaseEndsAt,
+        isPaused,
+        statusTimeLeft,
+        serverTimeOffsetRef.current,
+        Date.now()
+      );
 
     setDisplayTime(calcRemaining());
 
+    if (!phaseEndsAt && !isPaused) return;
+
+    // 200ms tick interval ensures crisp, synchronized display transitions across integer seconds
     const tickInterval = setInterval(() => {
       if (statusRef.current?.is_paused) return;
 
@@ -135,7 +162,7 @@ export default function Round1() {
         deadlineRequestedRef.current = true;
         fetchStatus(true);
       }
-    }, 500);
+    }, 200);
 
     return () => clearInterval(tickInterval);
   }, [phaseEndsAt, isPaused, statusTimeLeft, fetchStatus]);
@@ -160,31 +187,18 @@ export default function Round1() {
       });
 
       // Late acknowledgement guard: Ensure question has not progressed to Q2 before marking answered
-      setStatus((prev) => {
-        if (!prev || prev.question?.id !== targetQuestionId) {
-          // Question advanced while request was in-flight; do NOT mark new question answered!
-          return prev;
-        }
-        return {
-          ...prev,
-          team_submission: {
-            answered: true,
-            answer: data?.answer || letter,
-            submitted_at: new Date().toISOString(),
-          },
-        };
-      });
-
+      setStatus((prev) => applyAnswerConfirmation(prev, targetQuestionId, data, letter));
       toast.success("Answer locked in!");
     } catch (e) {
       // Reconcile with server to verify if answer was recorded (e.g. by teammate or connection drop)
       const freshStatus = await fetchStatus(false);
-      if (freshStatus?.team_submission?.answered) {
-        toast.info("Answer was locked in by a teammate.");
+      const outcome = handleSubmissionFailure(freshStatus, formatApiError, e);
+      if (outcome.recovered) {
+        toast.info(outcome.message);
       } else {
         // Request failed and no answer exists on server: allow player to retry!
         setPendingChoice(null);
-        toast.error(formatApiError(e) || "Submission failed. Please select your answer again.");
+        toast.error(outcome.message);
       }
     } finally {
       setSubmitting(false);
@@ -282,7 +296,7 @@ export default function Round1() {
   }
 
   // 3. COMPLETION SCREEN
-  if (status.phase === "COMPLETED" || (status.round_state === "COMPLETED" && status.phase !== "RESULT")) {
+  if (status.phase === "COMPLETED" || (status.round_state === "COMPLETED" && status.phase !== "RESULT" && status.phase !== "WAITING" && status.status !== "IDLE")) {
     return (
       <Shell>
         <div className="mm-panel mm-corner-ticks p-8 sm:p-12 max-w-2xl mx-auto text-center" data-testid="r1-complete-screen">

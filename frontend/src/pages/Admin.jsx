@@ -14,17 +14,20 @@ export default function Admin() {
   const [audit, setAudit] = useState([]);
   const [annMsg, setAnnMsg] = useState("");
   const [tab, setTab] = useState("control");
+  const [explanations, setExplanations] = useState([]);
 
   const load = async () => {
     try {
-      const [c, a, t, tm, al] = await Promise.all([
+      const [c, a, t, tm, al, ex] = await Promise.all([
         api.get("/event/config"),
         api.get("/admin/analytics"),
         api.get("/admin/trades"),
         api.get("/admin/teams"),
         api.get("/admin/audit-logs"),
+        api.get("/admin/round2/explanations").catch(() => ({ data: [] })),
       ]);
       setCfg(c.data); setAnalytics(a.data); setTrades(t.data); setTeams(tm.data); setAudit(al.data);
+      setExplanations(ex?.data || []);
     } catch (e) { toast.error(formatApiError(e)); }
   };
   useEffect(() => { load(); const i = setInterval(load, 10000); return () => clearInterval(i); }, []);
@@ -95,6 +98,7 @@ export default function Admin() {
           <Tab k="control" label="Event Control" />
           <Tab k="questions-r1" label="R1 Questions" />
           <Tab k="questions-r2" label="R2 Charts" />
+          <Tab k="explanations" label="R2 Explanations" />
           <Tab k="verify" label="Trade Verify" />
           <Tab k="teams" label="Teams" />
           <Tab k="config" label="Config" />
@@ -126,11 +130,18 @@ export default function Admin() {
                   Registration: <span className={cfg.registration_open ? "text-mm-green" : "text-mm-red"}>{cfg.registration_open ? "OPEN" : "CLOSED"}</span>
                   <span className="text-mm-text2 mx-3">·</span>
                   Leaderboard: <span className={cfg.leaderboard_visible ? "text-mm-green" : "text-mm-red"}>{cfg.leaderboard_visible ? "VISIBLE" : "HIDDEN"}</span>
+                  <span className="text-mm-text2 mx-3">·</span>
+                  Results: <span className={cfg.results_finalized ? "text-mm-green" : "text-mm-gold"}>{cfg.results_finalized ? "FINALIZED" : "UNFINALIZED"}</span>
                 </div>
               </div>
               <div className="flex gap-3 flex-wrap">
                 <button onClick={() => eventAction("start", "Start the event? Opens registration and resets all rounds to UPCOMING.")} data-testid="event-start-btn" className="btn-primary">▶ Start Event</button>
                 <button onClick={() => eventAction("stop", "Stop the event? Closes registration and marks all rounds COMPLETED. Scores remain visible.")} data-testid="event-stop-btn" className="btn-ghost border-mm-red text-mm-red hover:border-mm-red">■ Stop Event</button>
+                {cfg.results_finalized ? (
+                  <button onClick={() => eventAction("reopen", "Reopen results? This allows score modifications and pending trade reviews again.")} data-testid="event-reopen-btn" className="btn-ghost border-mm-gold text-mm-gold hover:bg-mm-gold/10">🔓 Reopen Results</button>
+                ) : (
+                  <button onClick={() => eventAction("finalize", "Finalize results? This action authoritatively publishes final ceremony standings. All rounds must be completed and pending trade verifications must be complete.")} data-testid="event-finalize-btn" className="btn-primary border-mm-gold text-mm-gold hover:bg-mm-gold/10">★ Finalize Results</button>
+                )}
                 <button onClick={() => eventAction("reset", "RESET WIPES all submissions, trades, Round 3 sessions, and overrides. Teams and questions are preserved. Continue?")} data-testid="event-reset-btn" className="btn-ghost">↺ Reset Gameplay</button>
               </div>
             </div>
@@ -163,6 +174,65 @@ export default function Admin() {
 
       {tab === "questions-r1" && <QuestionsPanel initialRound={1} key="r1" />}
       {tab === "questions-r2" && <QuestionsPanel initialRound={2} key="r2" />}
+
+      {tab === "explanations" && (
+        <div className="space-y-4 mt-8">
+          <div className="flex items-center justify-between">
+            <div className="font-mono text-xs text-mm-text2">
+              Showing {explanations.length} Round 2 submissions with mandatory explanations.
+            </div>
+            <button onClick={() => exportCsv("round2")} data-testid="admin-export-r2-btn" className="btn-ghost text-xs">
+              ⬇ Export round2.csv
+            </button>
+          </div>
+          <div className="mm-panel mm-corner-ticks overflow-x-auto" data-testid="admin-explanations-table">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left font-mono text-[10px] tracking-widest text-mm-text2 border-b border-mm-border">
+                  <th className="p-3">TEAM</th>
+                  <th className="p-3">#</th>
+                  <th className="p-3">DECISION</th>
+                  <th className="p-3">CORRECT</th>
+                  <th className="p-3">PTS</th>
+                  <th className="p-3">EXPLANATION</th>
+                  <th className="p-3 text-right">TIME</th>
+                </tr>
+              </thead>
+              <tbody>
+                {explanations.map((e) => (
+                  <tr key={e.id} className="border-b border-mm-border/50" data-testid={`admin-explanation-row-${e.id}`}>
+                    <td className="p-3 font-serif">{e.team_name}</td>
+                    <td className="p-3 font-mono">Q{Number(e.question_order) + 1}</td>
+                    <td className="p-3 font-mono">
+                      <span className={`px-2 py-0.5 text-xs font-bold ${
+                        e.decision === "BUY" ? "text-mm-green bg-mm-green/10" :
+                        e.decision === "SELL" ? "text-mm-red bg-mm-red/10" : "text-mm-gold bg-mm-gold/10"
+                      }`}>
+                        {e.decision}
+                      </span>
+                    </td>
+                    <td className="p-3 font-mono text-xs">{e.correct_answer || "—"}</td>
+                    <td className="p-3 font-mono text-xs">{e.score ?? 0}</td>
+                    <td className="p-3 font-mono text-xs max-w-md text-mm-text break-words">
+                      "{e.explanation}"
+                    </td>
+                    <td className="p-3 font-mono text-[11px] text-mm-text2 text-right">
+                      {new Date(e.submitted_at).toLocaleTimeString()}
+                    </td>
+                  </tr>
+                ))}
+                {explanations.length === 0 && (
+                  <tr>
+                    <td colSpan="7" className="p-10 text-center text-mm-text2 font-mono text-xs">
+                      No Round 2 explanations submitted yet.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
 
       {tab === "verify" && (
         <div className="mm-panel mm-corner-ticks mt-8 overflow-x-auto" data-testid="admin-verify-table">

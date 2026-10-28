@@ -3,7 +3,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 
 const emptyR1 = () => ({ round: 1, text: "", options: ["", "", "", ""], correct_answer: "A", base_points: 100, time_limit: 30, order: 0 });
-const emptyR2 = () => ({ round: 2, text: "", options: ["BUY", "SELL", "NO_TRADE"], correct_answer: "BUY", base_points: 100, time_limit: 45, asset: "", timeframe: "1H", chart_image_url: "", order: 0 });
+const emptyR2 = () => ({ round: 2, text: "", options: ["BUY", "SELL", "NO_TRADE"], correct_answer: "BUY", base_points: 1, time_limit: 120, asset: "", timeframe: "1H", chart_image_url: "", order: 0 });
 
 export default function QuestionsPanel({ initialRound = 1 }) {
   const [round, setRound] = useState(initialRound);
@@ -32,16 +32,21 @@ export default function QuestionsPanel({ initialRound = 1 }) {
     setEditingId(null);
   }, [load, round]);
 
-  const isLocked = round === 1 && (roundState === "ACTIVE" || roundState === "PAUSED");
+  const isLocked = (round === 1 || round === 2) && (roundState === "ACTIVE" || roundState === "PAUSED");
 
   const save = async (e) => {
     e.preventDefault();
     if (isLocked) {
-      toast.error("Cannot modify Round 1 questions while Round 1 is active or paused.");
+      toast.error(`Cannot modify Round ${round} questions while Round ${round} is active or paused.`);
       return;
     }
     try {
-      const payload = { ...form, order: +form.order, base_points: +form.base_points, time_limit: +form.time_limit };
+      const payload = {
+        ...form,
+        order: +form.order,
+        base_points: round === 2 ? 1 : +form.base_points,
+        time_limit: +form.time_limit,
+      };
       if (editingId) await api.put(`/questions/${editingId}`, payload);
       else await api.post("/questions", payload);
       toast.success(editingId ? "Question updated" : "Question added");
@@ -55,7 +60,7 @@ export default function QuestionsPanel({ initialRound = 1 }) {
 
   const edit = (q) => {
     if (isLocked) {
-      toast.error("Cannot edit questions while Round 1 is active or paused.");
+      toast.error(`Cannot edit questions while Round ${round} is active or paused.`);
       return;
     }
     setEditingId(q.id);
@@ -65,7 +70,7 @@ export default function QuestionsPanel({ initialRound = 1 }) {
 
   const del = async (id) => {
     if (isLocked) {
-      toast.error("Cannot delete questions while Round 1 is active or paused.");
+      toast.error(`Cannot delete questions while Round ${round} is active or paused.`);
       return;
     }
     if (!window.confirm("Delete this question?")) return;
@@ -88,7 +93,7 @@ export default function QuestionsPanel({ initialRound = 1 }) {
     <div className="mt-8 space-y-6" data-testid={`admin-questions-panel-r${round}`}>
       <div className="flex items-center gap-3">
         <div className="font-mono text-[11px] tracking-widest text-mm-gold">
-          {round === 1 ? "// ROUND 1 · QUIZ QUESTIONS" : "// ROUND 2 · CHART QUESTIONS"}
+          {round === 1 ? "// ROUND 1 · QUIZ QUESTIONS" : "// ROUND 2 · CHART QUESTIONS (AUDITORIUM SCREEN)"}
         </div>
         <span className="font-mono text-[11px] text-mm-text2 ml-auto">
           {qs.length} {round === 1 ? "question" : "chart"}{qs.length === 1 ? "" : "s"} added
@@ -97,8 +102,14 @@ export default function QuestionsPanel({ initialRound = 1 }) {
 
       {isLocked && (
         <div className="p-4 border border-mm-gold/50 bg-mm-gold/10 mm-corner-ticks font-mono text-xs text-mm-gold flex items-center justify-between">
-          <span>⚠ ROUND 1 IS CURRENTLY {roundState}. Questions are locked from being added, edited, or deleted during active gameplay.</span>
+          <span>⚠ ROUND {round} IS CURRENTLY {roundState}. Questions are locked from being added, edited, or deleted during active gameplay.</span>
           <span className="px-2 py-0.5 bg-mm-gold text-black uppercase font-bold text-[10px]">LOCKED</span>
+        </div>
+      )}
+
+      {round === 2 && (
+        <div className="p-4 border border-mm-border bg-mm-panel/40 font-mono text-xs text-mm-text2">
+          ℹ Charts are displayed on the external auditorium screen. No chart image upload or URL required for participant screens.
         </div>
       )}
 
@@ -114,12 +125,6 @@ export default function QuestionsPanel({ initialRound = 1 }) {
             <Field label="Order" type="number" min={0} value={form.order} onChange={(e) => setForm({ ...form, order: e.target.value })} tid="q-input-order" />
           </div>
         )}
-        {round === 2 && (
-          <div>
-            <Field label="Chart Image URL" value={form.chart_image_url || ""} onChange={(e) => setForm({ ...form, chart_image_url: e.target.value })} placeholder="https://… screenshot URL" tid="q-input-chart" required />
-            {form.chart_image_url && <img src={form.chart_image_url} alt="preview" className="mt-3 max-h-56 border border-mm-border" />}
-          </div>
-        )}
 
         <label className="block">
           <div className="font-mono text-[10px] uppercase tracking-widest text-mm-text2 mb-2">Question Prompt</div>
@@ -131,7 +136,7 @@ export default function QuestionsPanel({ initialRound = 1 }) {
             disabled={isLocked}
             onChange={(e) => setForm({ ...form, text: e.target.value })}
             className="w-full px-4 py-3 font-mono text-sm disabled:opacity-50"
-            placeholder={round === 1 ? "What does P/E stand for?" : "Describe the chart setup…"}
+            placeholder={round === 1 ? "What does P/E stand for?" : "Chart prompt (e.g., Identify setup and determine decision)"}
           />
         </label>
 
@@ -153,11 +158,33 @@ export default function QuestionsPanel({ initialRound = 1 }) {
               onChange={(e) => setForm({ ...form, correct_answer: e.target.value })}
               className="w-full px-4 py-3 font-mono text-sm disabled:opacity-50"
             >
-              {round === 1 ? ["A", "B", "C", "D"].map((v) => <option key={v} value={v}>{v}</option>) : ["BUY", "SELL", "NO_TRADE"].map((v) => <option key={v} value={v}>{v}</option>)}
+              {round === 1 ? (
+                ["A", "B", "C", "D"].map((v) => <option key={v} value={v}>{v}</option>)
+              ) : (
+                ["BUY", "SELL"].map((v) => <option key={v} value={v}>{v}</option>)
+              )}
             </select>
           </label>
-          <Field label="Base Points" type="number" min={1} value={form.base_points} disabled={isLocked} onChange={(e) => setForm({ ...form, base_points: e.target.value })} tid="q-input-base" required />
-          <Field label="Time Limit (sec)" type="number" min={5} value={form.time_limit} disabled={isLocked} onChange={(e) => setForm({ ...form, time_limit: e.target.value })} tid="q-input-time" required />
+          <Field
+            label="Points"
+            type="number"
+            min={1}
+            value={round === 2 ? 1 : form.base_points}
+            disabled={isLocked || round === 2}
+            onChange={(e) => setForm({ ...form, base_points: e.target.value })}
+            tid="q-input-base"
+            required
+          />
+          <Field
+            label="Time Limit (sec)"
+            type="number"
+            min={5}
+            value={form.time_limit}
+            disabled={isLocked}
+            onChange={(e) => setForm({ ...form, time_limit: e.target.value })}
+            tid="q-input-time"
+            required
+          />
           {round === 1 && <Field label="Order" type="number" min={0} value={form.order} disabled={isLocked} onChange={(e) => setForm({ ...form, order: e.target.value })} tid="q-input-order" />}
         </div>
 

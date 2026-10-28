@@ -1,11 +1,57 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import Nav from "@/components/Nav";
 import { api } from "@/lib/api";
 
 export default function Results() {
   const [rows, setRows] = useState([]);
-  useEffect(() => { api.get("/leaderboard").then((r) => setRows((r.data.rows || []).slice(0, 10))); }, []);
-  const [first, second, third, ...rest] = rows;
+  const [cfg, setCfg] = useState(null);
+
+  const inFlightPromiseRef = useRef(null);
+  const latestRequestIdRef = useRef(0);
+
+  const refresh = useCallback(async () => {
+    if (inFlightPromiseRef.current) return inFlightPromiseRef.current;
+
+    const reqId = ++latestRequestIdRef.current;
+    const task = (async () => {
+      try {
+        const [c, lb] = await Promise.all([
+          api.get("/event/config"),
+          api.get("/leaderboard"),
+        ]);
+        if (reqId === latestRequestIdRef.current) {
+          setCfg(c.data);
+          setRows((lb.data?.rows || []).slice(0, 10));
+        }
+      } catch (e) {
+        // Ignore transient errors
+      } finally {
+        if (inFlightPromiseRef.current === task) {
+          inFlightPromiseRef.current = null;
+        }
+      }
+    })();
+    inFlightPromiseRef.current = task;
+    return task;
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    const interval = setInterval(refresh, 5000);
+    const onVisibilityOrFocus = () => {
+      if (document.visibilityState === "visible") refresh();
+    };
+    window.addEventListener("focus", onVisibilityOrFocus);
+    document.addEventListener("visibilitychange", onVisibilityOrFocus);
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", onVisibilityOrFocus);
+      document.removeEventListener("visibilitychange", onVisibilityOrFocus);
+    };
+  }, [refresh]);
+
+  const isFinalized = Boolean(cfg?.results_finalized);
+  const [first, second, third] = rows;
 
   const podium = (team, place, color, h) => team ? (
     <div className="flex flex-col items-center" data-testid={`podium-${place}`}>
@@ -21,10 +67,18 @@ export default function Results() {
     <div className="min-h-screen bg-mm-bg">
       <Nav />
       <div className="max-w-7xl mx-auto px-6 py-16">
-        <div className="text-center">
-          <div className="font-mono text-[11px] tracking-[0.3em] text-mm-gold">// FINAL CEREMONY</div>
-          <h1 className="font-serif text-5xl sm:text-7xl mt-4">THE MARKET HAS SPOKEN.</h1>
-          <p className="text-mm-text2 mt-4 font-mono text-sm tracking-wider">The floor is closed. The standings are final.</p>
+        <div className="text-center" data-testid="results-header-container">
+          <div className="font-mono text-[11px] tracking-[0.3em] text-mm-gold" data-testid="results-badge">
+            {isFinalized ? "// FINAL CEREMONY" : "// CURRENT STANDINGS"}
+          </div>
+          <h1 className="font-serif text-5xl sm:text-7xl mt-4" data-testid="results-title">
+            {isFinalized ? "THE MARKET HAS SPOKEN." : "Current Standings"}
+          </h1>
+          <p className="text-mm-text2 mt-4 font-mono text-sm tracking-wider" data-testid="results-subtitle">
+            {isFinalized
+              ? "The floor is closed. The standings are final."
+              : "Active standings during live tournament play. Final standings will be declared after Round 3."}
+          </p>
         </div>
 
         <div className="mt-16 grid grid-cols-3 gap-6 items-end max-w-4xl mx-auto">

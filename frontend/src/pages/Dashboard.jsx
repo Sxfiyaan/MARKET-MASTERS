@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import Nav from "@/components/Nav";
 import Ticker from "@/components/Ticker";
@@ -17,7 +17,7 @@ const RoundTile = ({ num, title, state, href, tid, cta }) => {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary inline-block">{cta}</Link>;
   } else if (state === "PAUSED") {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary border-mm-gold text-mm-gold inline-block">Enter Round (Paused)</Link>;
-  } else if (state === "UPCOMING" && num === "01") {
+  } else if (state === "UPCOMING" && (num === "01" || num === "02")) {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">Enter Waiting Room</Link>;
   } else if (state === "COMPLETED") {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">View Summary</Link>;
@@ -43,14 +43,63 @@ export default function Dashboard() {
   const [scores, setScores] = useState(null);
   const [announcements, setAnns] = useState([]);
 
-  useEffect(() => {
-    (async () => {
-      const [c, s, a] = await Promise.all([
-        api.get("/event/config"), api.get("/scores/me"), api.get("/announcements"),
-      ]);
-      setCfg(c.data); setScores(s.data); setAnns(a.data);
+  const inFlightPromiseRef = useRef(null);
+  const latestRequestIdRef = useRef(0);
+
+  const refresh = useCallback(async () => {
+    // Coalesce duplicate focus/visibility/poll requests while a refresh is already running
+    if (inFlightPromiseRef.current) {
+      return inFlightPromiseRef.current;
+    }
+
+    const reqId = ++latestRequestIdRef.current;
+    const task = (async () => {
+      try {
+        const [c, s, a] = await Promise.all([
+          api.get("/event/config"), api.get("/scores/me"), api.get("/announcements"),
+        ]);
+        // Prevent older out-of-order responses from overwriting newer state
+        if (reqId === latestRequestIdRef.current) {
+          setCfg(c.data);
+          setScores(s.data);
+          setAnns(Array.isArray(a?.data) ? a.data : []);
+        }
+      } catch (e) {
+        // Ignore transient background refresh errors
+      } finally {
+        if (inFlightPromiseRef.current === task) {
+          inFlightPromiseRef.current = null;
+        }
+      }
     })();
+
+    inFlightPromiseRef.current = task;
+    return task;
   }, []);
+
+  useEffect(() => {
+    refresh();
+
+    // Modest background status check (3.5s, matching Round 1 polling frequency)
+    const interval = setInterval(refresh, 3500);
+
+    // Immediate recovery when window or tab gains focus or visibility
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        refresh();
+      }
+    };
+    const onFocus = () => refresh();
+
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refresh]);
 
   const rs = (n) => cfg?.rounds?.[String(n)]?.state || "UPCOMING";
   const team = user?.team;
