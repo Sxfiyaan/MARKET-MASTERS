@@ -141,6 +141,28 @@ export default function Dashboard() {
           </div>
         )}
 
+        {cfg?.results_finalized && cfg?.leaderboard_visible && (
+          <div
+            className="mm-panel mm-corner-ticks p-6 mt-8 bg-gradient-to-r from-mm-gold/15 via-mm-panel to-mm-gold/10 border-mm-gold/60"
+            data-testid="final-standings-callout"
+          >
+            <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+              <div>
+                <div className="font-mono text-[10px] tracking-widest text-mm-gold uppercase">// RESULTS FINALIZED</div>
+                <div className="font-serif text-3xl mt-1 text-white">The Market Has Spoken.</div>
+                <div className="text-mm-text2 font-mono text-xs mt-1">Official tournament standings and ceremony results are published.</div>
+              </div>
+              <Link
+                to="/results"
+                data-testid="view-final-standings-btn"
+                className="btn-primary inline-flex items-center gap-2 whitespace-nowrap shadow-lg shadow-mm-gold/20"
+              >
+                🏆 View Final Standings →
+              </Link>
+            </div>
+          </div>
+        )}
+
         <div className="grid md:grid-cols-3 gap-6 mt-10">
           <RoundTile num="01" title="THE QUIZ" state={rs(1)} href="/round1" tid="dashboard-round-1" cta="Start Round 1" />
           <RoundTile num="02" title="THE CALL" state={rs(2)} href="/round2" tid="dashboard-round-2" cta="Start Round 2" />

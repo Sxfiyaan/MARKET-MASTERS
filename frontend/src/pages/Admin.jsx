@@ -15,6 +15,7 @@ export default function Admin() {
   const [annMsg, setAnnMsg] = useState("");
   const [tab, setTab] = useState("control");
   const [explanations, setExplanations] = useState([]);
+  const [actionInProgress, setActionInProgress] = useState(null);
 
   const load = async () => {
     try {
@@ -57,9 +58,18 @@ export default function Admin() {
   };
 
   const eventAction = async (action, confirmText) => {
+    if (actionInProgress) return;
     if (confirmText && !window.confirm(confirmText)) return;
-    try { await api.post("/admin/event/action", { action }); toast.success(`Event ${action}`); await load(); }
-    catch (e) { toast.error(formatApiError(e)); }
+    setActionInProgress(action);
+    try {
+      await api.post("/admin/event/action", { action });
+      toast.success(`Event ${action}`);
+      await load();
+    } catch (e) {
+      toast.error(formatApiError(e));
+    } finally {
+      setActionInProgress(null);
+    }
   };
 
   const broadcast = async () => {
@@ -135,14 +145,49 @@ export default function Admin() {
                 </div>
               </div>
               <div className="flex gap-3 flex-wrap">
-                <button onClick={() => eventAction("start", "Start the event? Opens registration and resets all rounds to UPCOMING.")} data-testid="event-start-btn" className="btn-primary">▶ Start Event</button>
-                <button onClick={() => eventAction("stop", "Stop the event? Closes registration and marks all rounds COMPLETED. Scores remain visible.")} data-testid="event-stop-btn" className="btn-ghost border-mm-red text-mm-red hover:border-mm-red">■ Stop Event</button>
+                <button
+                  onClick={() => eventAction("start", "Start the event? Opens registration and resets all rounds to UPCOMING.")}
+                  data-testid="event-start-btn"
+                  disabled={Boolean(actionInProgress)}
+                  className="btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {actionInProgress === "start" ? "Starting…" : "▶ Start Event"}
+                </button>
+                <button
+                  onClick={() => eventAction("stop", "Stop the event? Closes registration and marks all rounds COMPLETED. Scores remain visible.")}
+                  data-testid="event-stop-btn"
+                  disabled={Boolean(actionInProgress)}
+                  className="btn-ghost border-mm-red text-mm-red hover:border-mm-red hover:bg-mm-red/10 focus:outline-none focus:ring-2 focus:ring-mm-red focus:ring-offset-2 focus:ring-offset-mm-bg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {actionInProgress === "stop" ? "Stopping…" : "■ Stop Event"}
+                </button>
                 {cfg.results_finalized ? (
-                  <button onClick={() => eventAction("reopen", "Reopen results? This allows score modifications and pending trade reviews again.")} data-testid="event-reopen-btn" className="btn-ghost border-mm-gold text-mm-gold hover:bg-mm-gold/10">🔓 Reopen Results</button>
+                  <button
+                    onClick={() => eventAction("reopen", "Reopen results? This allows score modifications and pending trade reviews again.")}
+                    data-testid="event-reopen-btn"
+                    disabled={Boolean(actionInProgress)}
+                    className="btn-ghost border-mm-gold text-mm-gold hover:bg-mm-gold/10 focus:outline-none focus:ring-2 focus:ring-mm-gold focus:ring-offset-2 focus:ring-offset-mm-bg disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+                  >
+                    {actionInProgress === "reopen" ? "Reopening…" : "🔓 Reopen Results"}
+                  </button>
                 ) : (
-                  <button onClick={() => eventAction("finalize", "Finalize results? This action authoritatively publishes final ceremony standings. All rounds must be completed and pending trade verifications must be complete.")} data-testid="event-finalize-btn" className="btn-primary border-mm-gold text-mm-gold hover:bg-mm-gold/10">★ Finalize Results</button>
+                  <button
+                    onClick={() => eventAction("finalize", "Finalize results? This action authoritatively publishes final ceremony standings. All rounds must be completed and pending trade verifications must be complete.")}
+                    data-testid="event-finalize-btn"
+                    disabled={Boolean(actionInProgress)}
+                    className="btn-ghost border-mm-gold text-mm-gold hover:bg-mm-gold/10 focus:outline-none focus:ring-2 focus:ring-mm-gold focus:ring-offset-2 focus:ring-offset-mm-bg disabled:opacity-50 disabled:cursor-not-allowed inline-flex items-center gap-2"
+                  >
+                    {actionInProgress === "finalize" ? "Finalizing…" : "★ Finalize Results"}
+                  </button>
                 )}
-                <button onClick={() => eventAction("reset", "RESET WIPES all submissions, trades, Round 3 sessions, and overrides. Teams and questions are preserved. Continue?")} data-testid="event-reset-btn" className="btn-ghost">↺ Reset Gameplay</button>
+                <button
+                  onClick={() => eventAction("reset", "RESET WIPES all submissions, trades, Round 3 sessions, and overrides. Teams and questions are preserved. Continue?")}
+                  data-testid="event-reset-btn"
+                  disabled={Boolean(actionInProgress)}
+                  className="btn-ghost focus:outline-none focus:ring-2 focus:ring-mm-border-bright focus:ring-offset-2 focus:ring-offset-mm-bg disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {actionInProgress === "reset" ? "Resetting…" : "↺ Reset Gameplay"}
+                </button>
               </div>
             </div>
           </div>

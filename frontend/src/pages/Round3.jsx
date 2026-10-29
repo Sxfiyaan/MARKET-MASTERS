@@ -575,7 +575,7 @@ function Rules({ startingCapital, maxRisk }) {
         <li>⚖️ Each trade is scored as: 0.60 × Performance + 0.40 × Risk Management.</li>
         <li>🏆 R3 Raw Score = (Trade 1 Score + Trade 2 Score) / 2.</li>
         <li>🚫 Only VERIFIED trades contribute. Missing or rejected slots contribute 0.</li>
-        <li>⚠️ Risk &gt; 50% triggers a penalty. Manage your capital accordingly!</li>
+        <li>⚠️ Risk &gt; 50% → penalty (threshold condition; exactly 50% does not trigger penalty).</li>
       </ul>
     </div>
   );

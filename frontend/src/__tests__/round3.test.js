@@ -79,4 +79,52 @@ describe("Round 3 Synchronized Client Tests", () => {
     expect(isValidNumericInput(100000, Infinity, 5000, 0, 5.0)).toBe(false); // Infinity
     expect(isValidNumericInput(100000, 1.5, -100, 0, 5.0)).toBe(false); // negative profit
   });
+
+  test("Landing page confirms 90 minutes rules, eliminates 1 hour references, and updates risk penalty threshold", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const source = fs.readFileSync(path.resolve(__dirname, "../pages/Landing.jsx"), "utf8");
+
+    // Must contain 90 minutes for Round 3
+    expect(source).toMatch(/90 minutes/i);
+
+    // Must NOT contain "One hour" or "1 hour" or "1-hour"
+    expect(source).not.toMatch(/one hour/i);
+    expect(source).not.toMatch(/1 hour/i);
+    expect(source).not.toMatch(/1-hour/i);
+
+    // Outdated "Risk > 2% → penalty" must be replaced with "Risk > 50% → penalty"
+    expect(source).not.toMatch(/risk\s*(?:>|&gt;)\s*2%\s*→\s*penalty/i);
+    expect(source).toMatch(/risk\s*(?:>|&gt;)\s*50%\s*→/i);
+
+    // Preserves legitimate references to max_risk (1% and 2%) used by bonus/loss formulas
+    expect(source).toMatch(/risk\s*≤\s*1%/i);
+    expect(source).toMatch(/risk\s*≤\s*2%/i);
+  });
+
+  test("Round 3 page confirms exact Risk > 50% penalty threshold description", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const source = fs.readFileSync(path.resolve(__dirname, "../pages/Round3.jsx"), "utf8");
+
+    expect(source).toMatch(/risk\s*(?:>|&gt;)\s*50%\s*→\s*penalty/i);
+    expect(source).toMatch(/exactly 50% does not trigger penalty/i);
+  });
+
+  test("Admin Finalize Results button source confirms outlined styling, keyboard focus, and in-flight guard", () => {
+    const fs = require("fs");
+    const path = require("path");
+    const source = fs.readFileSync(path.resolve(__dirname, "../pages/Admin.jsx"), "utf8");
+
+    // Button uses outlined btn-ghost style with gold accent
+    expect(source).toMatch(/btn-ghost border-mm-gold text-mm-gold/);
+
+    // Button provides keyboard focus ring
+    expect(source).toMatch(/focus:ring-2 focus:ring-mm-gold/);
+
+    // Button prevents repeated clicks via actionInProgress and disabled state
+    expect(source).toMatch(/actionInProgress/);
+    expect(source).toMatch(/disabled=\{Boolean\(actionInProgress\)\}/);
+    expect(source).toMatch(/actionInProgress === "finalize" \? "Finalizing…" : "★ Finalize Results"/);
+  });
 });

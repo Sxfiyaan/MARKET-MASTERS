@@ -90,7 +90,7 @@ export default function Landing() {
           <div className="grid md:grid-cols-3 gap-6 mt-10">
             <RoundCard num="01" title="THE QUIZ" tagline="KNOW THE MARKET." desc="20 finance & trading questions. Correctness × speed = score. One shot per question." tid="round-card-1" />
             <RoundCard num="02" title="THE CALL" tagline="READ THE CHART." desc="Live charts. Three choices: BUY, SELL, NO TRADE. Correct and fast earns the most." tid="round-card-2" />
-            <RoundCard num="03" title="THE TRADE" tagline="ONE HOUR. TWO TRADES." desc="A one-hour virtual trading challenge. Maximum two trades. Return alone does not win — risk management decides." tid="round-card-3" />
+            <RoundCard num="03" title="THE TRADE" tagline="90 MINUTES. TWO TRADES." desc="A 90-minute virtual trading challenge. Maximum two trades. Return alone does not win — risk management decides." tid="round-card-3" />
           </div>
         </div>
       </section>
@@ -99,10 +99,10 @@ export default function Landing() {
         <div className="max-w-7xl mx-auto px-6 lg:px-10 py-20 grid lg:grid-cols-2 gap-10 items-center">
           <div>
             <div className="font-mono text-[11px] tracking-[0.3em] text-mm-gold">// ROUND 03 RULES</div>
-            <h2 className="font-serif text-4xl sm:text-5xl mt-3">One hour. Two trades. Zero mercy.</h2>
+            <h2 className="font-serif text-4xl sm:text-5xl mt-3">90 minutes. Two trades. Zero mercy.</h2>
             <ul className="mt-8 space-y-4 text-mm-text2">
               {[
-                ["⏱", "YOU HAVE 1 HOUR", "The timer is server-authoritative. Refresh does not reset it."],
+                ["⏱", "YOU HAVE 90 MINUTES", "The timer is server-authoritative. Refresh does not reset it."],
                 ["📊", "MAXIMUM 2 TRADES", "Trade 1. Trade 2. Then the floor closes."],
                 ["💰", "MANAGE YOUR CAPITAL", "Starting virtual capital is set by the organizer."],
                 ["⚠️", "RISK MANAGEMENT MATTERS", "Exceed the risk ceiling, lose risk-score points."],
@@ -128,7 +128,7 @@ export default function Landing() {
               <div>• Return mapped from [-5%, +10%] → [0, 1000]</div>
               <div>• Risk ≤ 1% → <span className="text-mm-green">excellent</span></div>
               <div>• Risk ≤ 2% → <span className="text-mm-gold">acceptable</span></div>
-              <div>• Risk &gt; 2% → <span className="text-mm-red">penalty</span></div>
+              <div>• Risk &gt; 50% → <span className="text-mm-red">penalty</span> (threshold: risk &gt; 50%, not a 50% deduction)</div>
               <div>• Weights configurable from Admin Console</div>
             </div>
             <Link to="/register" data-testid="rules-register-btn" className="btn-primary inline-block mt-8">Enter the Floor</Link>

@@ -152,4 +152,139 @@ describe("Register & Results Requirements", () => {
     expect(titleEl.textContent).toBe("Current Standings");
     expect(badgeEl.textContent).toContain("CURRENT STANDINGS");
   });
+
+  test("Results displays all teams (>10) without truncation, highlights signed-in team, and enforces responsive table", async () => {
+    // Isolated fixture with 15 teams
+    const mockTeams = Array.from({ length: 15 }, (_, i) => ({
+      team_id: `team-${i + 1}`,
+      team_name: `Team ${String.fromCharCode(65 + i)}`,
+      college: `Institute ${i + 1}`,
+      round1: 80 + i,
+      round2: 5 + i,
+      round3: 600 + i * 10,
+      risk_score: 500,
+      total: 300 + i * 15,
+      rank: i + 1,
+    }));
+
+    // Signed-in as team-7
+    authSpy.mockReturnValue({
+      user: {
+        id: "user-7",
+        team_id: "team-7",
+        role: "team",
+        team: { id: "team-7", team_name: "Team G", college: "Institute 7" },
+      },
+      logout: jest.fn(),
+    });
+
+    getSpy = jest.spyOn(api, "get").mockImplementation((url) => {
+      if (url === "/event/config") {
+        return Promise.resolve({
+          data: {
+            results_finalized: true,
+            leaderboard_visible: true,
+            rounds: {
+              "1": { state: "COMPLETED" },
+              "2": { state: "COMPLETED" },
+              "3": { state: "COMPLETED" },
+            },
+          },
+        });
+      }
+      if (url === "/leaderboard") {
+        return Promise.resolve({
+          data: {
+            visible: true,
+            rows: mockTeams,
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <Results />
+        </MemoryRouter>
+      );
+    });
+
+    // Check all 15 teams are rendered - NO top-10 truncation!
+    const rowElements = container.querySelectorAll('[data-testid^="standings-row-"]');
+    expect(rowElements.length).toBe(15);
+
+    // Verify ranks 1 through 15 are all present in order
+    for (let i = 1; i <= 15; i++) {
+      const row = container.querySelector(`[data-testid="standings-row-${i}"]`);
+      expect(row).toBeTruthy();
+      expect(row.textContent).toContain(`#${i}`);
+    }
+
+    // Verify signed-in team (team-7, rank 7) is clearly highlighted
+    const team7Row = container.querySelector('[data-testid="standings-row-7"]');
+    expect(team7Row).toBeTruthy();
+    expect(team7Row.getAttribute("data-is-user-team")).toBe("true");
+    expect(team7Row.className).toContain("bg-mm-gold/15");
+    expect(team7Row.className).toContain("border-l-4 border-l-mm-gold");
+
+    const badge = team7Row.querySelector('[data-testid="user-team-badge"]');
+    expect(badge).toBeTruthy();
+    expect(badge.textContent).toBe("YOUR TEAM");
+
+    // Other rows should NOT have user-team badge or attribute
+    const team1Row = container.querySelector('[data-testid="standings-row-1"]');
+    expect(team1Row.getAttribute("data-is-user-team")).toBeNull();
+    expect(team1Row.querySelector('[data-testid="user-team-badge"]')).toBeNull();
+
+    // Responsive table verification
+    const tableContainer = container.querySelector('[data-testid="results-table-container"]');
+    expect(tableContainer).toBeTruthy();
+    expect(tableContainer.className).toContain("overflow-x-auto");
+
+    const table = container.querySelector('[data-testid="final-standings-table"]');
+    expect(table).toBeTruthy();
+    expect(table.className).toContain("min-w-[640px]");
+  });
+
+  test("Results enforces server-side visibility restriction when leaderboard_visible is false", async () => {
+    getSpy = jest.spyOn(api, "get").mockImplementation((url) => {
+      if (url === "/event/config") {
+        return Promise.resolve({
+          data: {
+            results_finalized: true,
+            leaderboard_visible: false,
+          },
+        });
+      }
+      if (url === "/leaderboard") {
+        return Promise.resolve({
+          data: {
+            visible: false,
+            rows: [],
+          },
+        });
+      }
+      return Promise.reject(new Error(`Unhandled URL: ${url}`));
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <Results />
+        </MemoryRouter>
+      );
+    });
+
+    // Hidden message shown
+    const hiddenEl = container.querySelector('[data-testid="results-hidden-message"]');
+    expect(hiddenEl).toBeTruthy();
+    expect(hiddenEl.textContent).toContain("STANDINGS RESTRICTED");
+    expect(hiddenEl.textContent).toContain("Final standings are not visible yet.");
+
+    // Table and podium are NOT rendered
+    expect(container.querySelector('[data-testid="final-standings-table"]')).toBeNull();
+    expect(container.querySelector('[data-testid="podium-1"]')).toBeNull();
+  });
 });

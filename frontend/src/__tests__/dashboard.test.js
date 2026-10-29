@@ -213,4 +213,68 @@ describe("Dashboard Automatic Recovery & Synchronization", () => {
     expect(r2EnterBtn.textContent).toBe("Enter Waiting Room");
     expect(r2EnterBtn.getAttribute("href")).toBe("/round2");
   });
+
+  test("displays 'View Final Standings' button linking to /results when results_finalized and leaderboard_visible, updating via live-refresh without manual reload", async () => {
+    let resultsFinalized = false;
+    let leaderboardVisible = true;
+
+    getSpy = jest.spyOn(api, "get").mockImplementation((url) => {
+      if (url === "/event/config") {
+        return Promise.resolve({
+          data: {
+            results_finalized: resultsFinalized,
+            leaderboard_visible: leaderboardVisible,
+            rounds: {
+              "1": { state: "COMPLETED" },
+              "2": { state: "COMPLETED" },
+              "3": { state: "COMPLETED" },
+            },
+          },
+        });
+      }
+      if (url === "/scores/me") return Promise.resolve({ data: { rank: 1, total: 500, risk_score: 500 } });
+      if (url === "/announcements") return Promise.resolve({ data: [] });
+      return Promise.resolve({ data: null });
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <Dashboard />
+        </MemoryRouter>
+      );
+    });
+
+    // Initially unfinalized: no View Final Standings button
+    expect(container.querySelector('[data-testid="view-final-standings-btn"]')).toBeNull();
+    expect(container.querySelector('[data-testid="final-standings-callout"]')).toBeNull();
+
+    // Admin finalizes results: backend now returns results_finalized: true
+    resultsFinalized = true;
+
+    // Simulate focus/live-refresh without manual page reload
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    // Button appears automatically on live refresh
+    const standingsBtn = container.querySelector('[data-testid="view-final-standings-btn"]');
+    expect(standingsBtn).not.toBeNull();
+    expect(standingsBtn.textContent).toContain("View Final Standings");
+    expect(standingsBtn.getAttribute("href")).toBe("/results");
+
+    const callout = container.querySelector('[data-testid="final-standings-callout"]');
+    expect(callout).not.toBeNull();
+    expect(callout.textContent).toContain("The Market Has Spoken.");
+
+    // If organizer hides leaderboard, button disappears
+    leaderboardVisible = false;
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-testid="view-final-standings-btn"]')).toBeNull();
+  });
 });
