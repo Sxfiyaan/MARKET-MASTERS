@@ -138,12 +138,30 @@
 
 ## 6. Remaining Deployment Checks
 
-Before live production event deployment:
-1. **Organizer Environment Variables**:
-   - Ensure production `ADMIN_EMAIL` matches the organizer's Supabase auth email.
-   - Ensure production service role key and anon key are properly configured in deployment environment.
-2. **Event Verification Checklist**:
-   - Run manual acceptance walkthrough (detailed in completion report).
-   - Verify organizer TradingView review station has auditorium network connectivity.
-3. **Database Migration State**:
-   - Production Supabase database must have migrations `0001` through `0013` applied in sequence.
+### 6. Database Migration & Deployment State (Shared Supabase `qpdepehmplravgxagogt`)
+
+- **Applied Migrations**: All migrations `0001` through `0014` are applied to the shared Supabase project:
+  - `0001`–`0006`: Baseline tables, indexes, RLS, and grants (reconciled from original timestamp history).
+  - `0007`: Synchronized Round 1 state (`public.round1_state`) and transactional RPCs.
+  - `0008`: Results finalization safeguards (`event_config.results_finalized`) and finalization locks.
+  - `0009`–`0011`: Synchronized Round 2 state (`public.round2_state`) and concurrency controls.
+  - `0012`–`0013`: Synchronized Round 3 state (`public.round3_state`), authoritative P/L calculation, slot serialization, and dropped legacy 9-argument overload.
+  - `0014`: Restricted `public.leaderboard_snapshot` SELECT to when `coalesce((select leaderboard_visible from public.event_config where id = 'event'), false) = true`.
+- **Row-Level Security (RLS)**:
+  - PostgREST direct access to `leaderboard_snapshot` is guarded by `event_config.leaderboard_visible`.
+  - Service-role maintains full access (`BYPASSRLS`).
+- **Edge Function `market-api`**:
+  - Deployed version 7 with `--no-verify-jwt`.
+  - Application-level authentication enforced via `currentUser()` on protected participant and admin routes.
+  - Verified across all router endpoints using the actual public client key.
+
+---
+
+## 7. Rehearsal Preparation Action Items for Organizers
+
+Before commencing the auditorium rehearsal on shared Supabase:
+1. **Reset Round State**: In `event_config.rounds`, Rounds 2 and 3 are currently `ACTIVE` from pre-synchronization tests. Use the Admin Panel "Reset Gameplay Data" action (or Admin controls) to return all rounds to `UPCOMING`.
+2. **Set Max Risk Per Trade**: `event_config.max_risk_per_trade` is currently `0`. Set it to `2.0%` in Admin Settings to enable proper conservative risk bonuses (+100) and avoid universal loss penalties (-200).
+3. **Handle Pending Trade**: Resolve or reset the existing pending trade for team `sufi`.
+4. **Seed Round 1 Questions**: Add Round 1 questions via the Admin Panel (0 currently in database).
+5. **Vercel Root Directory**: Set Vercel project Root Directory to `frontend` before deploying production frontend build.
