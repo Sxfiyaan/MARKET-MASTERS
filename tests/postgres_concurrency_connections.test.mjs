@@ -563,6 +563,295 @@ test("Concurrency 7: admin_set_round2_state_tx rejects UPCOMING across independe
   assert.strictEqual(cleanSubCount, "0", "All R2 submissions must be cleared by reset");
 });
 
+test("Concurrency 8: Two teammates submitting the SAME Round 3 trade slot concurrently in PostgreSQL", async () => {
+  // Set Round 3 to ACTIVE
+  await execSql(`
+    UPDATE public.round3_state
+    SET status = 'ACTIVE',
+        phase = 'ACTIVE',
+        phase_start_at = clock_timestamp(),
+        phase_ends_at = clock_timestamp() + interval '90 minutes',
+        is_paused = false,
+        paused_remaining_ms = 0
+    WHERE id = 'current';
+    UPDATE public.event_config
+    SET rounds = jsonb_set(coalesce(rounds, '{}'::jsonb), '{3}', '{"state":"ACTIVE"}'::jsonb),
+        results_finalized = false
+    WHERE id = 'event';
+    DELETE FROM public.trades;
+  `);
+
+  // Connection 1: Teammate 1 starts transaction, submits Slot 1 for Team Alpha, sleeps 400ms, commits
+  const conn1Promise = runInteractiveSql(`
+    BEGIN;
+    SET role service_role;
+    SELECT public.submit_round3_trade_tx(
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      'BTC/USDT',
+      100000,
+      1.5,
+      'PROFIT',
+      5000,
+      0,
+      5.0,
+      NULL,
+      1
+    );
+    SELECT pg_sleep(0.4);
+    COMMIT;
+  `);
+
+  // Connection 2: Teammate 2 attempts submitting the SAME Slot 1 for Team Alpha 100ms later
+  await new Promise((r) => setTimeout(r, 100));
+
+  const conn2Start = Date.now();
+  const conn2Res = await execSql(`
+    SET role service_role;
+    SELECT public.submit_round3_trade_tx(
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      'BTC/USDT',
+      100000,
+      1.5,
+      'PROFIT',
+      5000,
+      0,
+      5.0,
+      NULL,
+      1
+    );
+  `);
+  const conn2Duration = Date.now() - conn2Start;
+
+  const conn1Lines = await conn1Promise;
+  const conn1Data = JSON.parse(conn1Lines[conn1Lines.length - 2]);
+  const conn2Data = JSON.parse(conn2Res);
+
+  // Assertions:
+  // 1. Connection 2 waited on the team row lock (> 200ms)
+  assert.ok(conn2Duration >= 200, `Connection 2 must serialize on team lock; duration was ${conn2Duration}ms`);
+
+  // 2. Teammate 1 succeeded
+  assert.strictEqual(conn1Data.ok, true, "First teammate submission must succeed");
+  assert.strictEqual(conn1Data.trade.trade_number, 1);
+
+  // 3. Teammate 2 rejected cleanly with SLOT_ALREADY_USED and returns existing trade without consuming slot 2
+  assert.strictEqual(conn2Data.ok, false, "Second teammate submission must be rejected");
+  assert.strictEqual(conn2Data.code, "SLOT_ALREADY_USED", "Must return SLOT_ALREADY_USED");
+  assert.strictEqual(conn2Data.trade.trade_number, 1);
+
+  // 4. Exactly one trade in database
+  const tradeCount = await execSql(`SELECT count(*) FROM public.trades WHERE team_id = '00000000-0000-0000-0000-000000000010'::uuid;`);
+  assert.strictEqual(tradeCount, "1", "Only exactly one trade may be persisted for slot 1");
+});
+
+test("Concurrency 9: Two teammates submitting DIFFERENT Round 3 slots concurrently in PostgreSQL", async () => {
+  // Clear trades
+  await execSql(`DELETE FROM public.trades;`);
+
+  // Connection 1: Teammate 1 submits Slot 1, sleeps 400ms, commits
+  const conn1Promise = runInteractiveSql(`
+    BEGIN;
+    SET role service_role;
+    SELECT public.submit_round3_trade_tx(
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      'BTC/USDT',
+      100000,
+      1.0,
+      'PROFIT',
+      5000,
+      0,
+      5.0,
+      NULL,
+      1
+    );
+    SELECT pg_sleep(0.4);
+    COMMIT;
+  `);
+
+  // Connection 2: Teammate 2 submits Slot 2 100ms later
+  await new Promise((r) => setTimeout(r, 100));
+
+  const conn2Res = await execSql(`
+    SET role service_role;
+    SELECT public.submit_round3_trade_tx(
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      'ETH/USDT',
+      100000,
+      1.0,
+      'LOSS',
+      0,
+      2000,
+      -2.0,
+      NULL,
+      2
+    );
+  `);
+
+  const conn1Lines = await conn1Promise;
+  const conn1Data = JSON.parse(conn1Lines[conn1Lines.length - 2]);
+  const conn2Data = JSON.parse(conn2Res);
+
+  assert.strictEqual(conn1Data.ok, true, "Slot 1 submission must succeed");
+  assert.strictEqual(conn1Data.trade.trade_number, 1);
+  assert.strictEqual(conn2Data.ok, true, "Slot 2 submission must succeed");
+  assert.strictEqual(conn2Data.trade.trade_number, 2);
+
+  const totalTrades = await execSql(`SELECT count(*) FROM public.trades WHERE team_id = '00000000-0000-0000-0000-000000000010'::uuid;`);
+  assert.strictEqual(totalTrades, "2", "Both slots must be successfully persisted");
+});
+
+test("Concurrency 10: Submission at/after shared deadline while stored state is still ACTIVE is rejected by PostgreSQL", async () => {
+  // Clear trades and set timing so phase_ends_at is in the PAST, but status is still ACTIVE
+  await execSql(`
+    DELETE FROM public.trades;
+    UPDATE public.round3_state
+    SET status = 'ACTIVE',
+        phase = 'ACTIVE',
+        phase_start_at = clock_timestamp() - interval '95 minutes',
+        phase_ends_at = clock_timestamp() - interval '5 minutes',
+        is_paused = false,
+        paused_remaining_ms = 0
+    WHERE id = 'current';
+    UPDATE public.event_config
+    SET rounds = jsonb_set(coalesce(rounds, '{}'::jsonb), '{3}', '{"state":"ACTIVE"}'::jsonb)
+    WHERE id = 'event';
+  `);
+
+  const expiredRes = await execSql(`
+    SET role service_role;
+    SELECT public.submit_round3_trade_tx(
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      'BTC/USDT',
+      100000,
+      1.0,
+      'PROFIT',
+      5000,
+      0,
+      5.0,
+      NULL,
+      1
+    );
+  `);
+  const expiredData = JSON.parse(expiredRes);
+  assert.strictEqual(expiredData.ok, false);
+  assert.strictEqual(expiredData.code, "DEADLINE_EXPIRED", "Must reject with DEADLINE_EXPIRED when clock_timestamp() >= phase_ends_at");
+
+  const count = await execSql(`SELECT count(*) FROM public.trades;`);
+  assert.strictEqual(count, "0", "No trade may be inserted after deadline");
+});
+
+test("Concurrency 11: Concurrent verify/reject and verify/delete actions on the same trade in PostgreSQL", async () => {
+  // Re-open timing and insert a trade for Alpha Desk
+  await execSql(`
+    UPDATE public.round3_state
+    SET status = 'ACTIVE',
+        phase = 'ACTIVE',
+        phase_start_at = clock_timestamp(),
+        phase_ends_at = clock_timestamp() + interval '90 minutes'
+    WHERE id = 'current';
+    DELETE FROM public.trades;
+    INSERT INTO public.trades (
+      id, team_id, trade_number, asset, account_size, risk_per_trade, result_type,
+      profit, loss, pl_percentage, verification_status, submitted_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000301'::uuid,
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      1, 'BTC/USDT', 100000, 1.5, 'PROFIT', 5000, 0, 5.0, 'PENDING', clock_timestamp()
+    );
+  `);
+
+  // Connection 1: Starts transaction, deletes trade, sleeps 400ms, commits
+  const conn1Promise = runInteractiveSql(`
+    BEGIN;
+    SET role service_role;
+    SELECT public.admin_delete_trade_tx('00000000-0000-0000-0000-000000000301'::uuid);
+    SELECT pg_sleep(0.4);
+    COMMIT;
+  `);
+
+  // Connection 2: Attempts to verify the same trade 100ms later while Connection 1 holds lock
+  await new Promise((r) => setTimeout(r, 100));
+
+  const conn2Start = Date.now();
+  const conn2Res = await execSql(`
+    SET role service_role;
+    SELECT public.admin_verify_trade_tx('00000000-0000-0000-0000-000000000301'::uuid, 'VERIFIED');
+  `);
+  const conn2Duration = Date.now() - conn2Start;
+
+  const conn1Lines = await conn1Promise;
+  const conn1Data = JSON.parse(conn1Lines[conn1Lines.length - 2]);
+  const conn2Data = JSON.parse(conn2Res);
+
+  assert.strictEqual(conn1Data.ok, true, "Delete must succeed");
+  // Connection 2 unblocks after delete commits; trade is gone, so it returns NOT_FOUND
+  assert.strictEqual(conn2Data.ok, false, "Verify must fail when trade was deleted");
+  assert.strictEqual(conn2Data.code, "NOT_FOUND");
+});
+
+test("Concurrency 12: Finalization requires all rounds COMPLETED and blocks if pending trades exist", async () => {
+  // Set all rounds to COMPLETED except Round 3
+  await execSql(`
+    UPDATE public.event_config
+    SET rounds = '{"1":{"state":"COMPLETED"},"2":{"state":"COMPLETED"},"3":{"state":"ACTIVE"}}'::jsonb,
+        results_finalized = false
+    WHERE id = 'event';
+    UPDATE public.round1_state SET status = 'COMPLETED', phase = 'COMPLETED' WHERE id = 'current';
+    UPDATE public.round2_state SET status = 'COMPLETED', phase = 'COMPLETED' WHERE id = 'current';
+    UPDATE public.round3_state SET status = 'ACTIVE', phase = 'ACTIVE' WHERE id = 'current';
+  `);
+
+  // Attempt finalization while R3 is still ACTIVE
+  const activeFinRes = await execSql(`
+    SET role service_role;
+    SELECT public.admin_finalize_results_tx();
+  `);
+  const activeFinData = JSON.parse(activeFinRes);
+  assert.strictEqual(activeFinData.ok, false);
+  assert.strictEqual(activeFinData.code, "ROUNDS_NOT_COMPLETED");
+
+  // Set R3 to COMPLETED, but add 1 PENDING trade
+  await execSql(`
+    UPDATE public.event_config
+    SET rounds = '{"1":{"state":"COMPLETED"},"2":{"state":"COMPLETED"},"3":{"state":"COMPLETED"}}'::jsonb
+    WHERE id = 'event';
+    UPDATE public.round3_state SET status = 'COMPLETED', phase = 'COMPLETED' WHERE id = 'current';
+    DELETE FROM public.trades;
+    INSERT INTO public.trades (
+      id, team_id, trade_number, asset, account_size, risk_per_trade, result_type,
+      profit, loss, pl_percentage, verification_status, submitted_at
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000302'::uuid,
+      '00000000-0000-0000-0000-000000000010'::uuid,
+      1, 'BTC/USDT', 100000, 1.5, 'PROFIT', 5000, 0, 5.0, 'PENDING', clock_timestamp()
+    );
+  `);
+
+  // Attempt finalization with pending trade -> BLOCKED
+  const pendingFinRes = await execSql(`
+    SET role service_role;
+    SELECT public.admin_finalize_results_tx();
+  `);
+  const pendingFinData = JSON.parse(pendingFinRes);
+  assert.strictEqual(pendingFinData.ok, false);
+  assert.strictEqual(pendingFinData.code, "PENDING_TRADES");
+
+  // Verify the trade
+  await execSql(`
+    SET role service_role;
+    SELECT public.admin_verify_trade_tx('00000000-0000-0000-0000-000000000302'::uuid, 'VERIFIED');
+  `);
+
+  // Attempt finalization again -> SUCCEEDS
+  const successFinRes = await execSql(`
+    SET role service_role;
+    SELECT public.admin_finalize_results_tx();
+  `);
+  const successFinData = JSON.parse(successFinRes);
+  assert.strictEqual(successFinData.ok, true);
+  assert.strictEqual(successFinData.results_finalized, true);
+});
+
 test("Cleanup isolated test database", async () => {
   await execSql(`DROP DATABASE IF EXISTS ${TEST_DB};`, "postgres");
 });

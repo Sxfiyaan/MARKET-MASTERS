@@ -239,7 +239,16 @@ export default function Admin() {
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left font-mono text-[10px] tracking-widest text-mm-text2 border-b border-mm-border">
-                <th className="p-3">TEAM</th><th className="p-3">#</th><th className="p-3">ASSET</th><th className="p-3 text-right">RISK</th><th className="p-3">RES</th><th className="p-3 text-right">P/L%</th><th className="p-3">STATUS</th><th className="p-3">ACTION</th>
+                <th className="p-3">TEAM</th>
+                <th className="p-3">#</th>
+                <th className="p-3">ASSET</th>
+                <th className="p-3 text-right">CAPITAL</th>
+                <th className="p-3 text-right">RISK</th>
+                <th className="p-3">RES</th>
+                <th className="p-3 text-right">P/L (₹)</th>
+                <th className="p-3 text-right">P/L%</th>
+                <th className="p-3">STATUS</th>
+                <th className="p-3">ACTION</th>
               </tr>
             </thead>
             <tbody>
@@ -248,10 +257,22 @@ export default function Admin() {
                   <td className="p-3 font-serif">{t.team_name}</td>
                   <td className="p-3 font-mono">{t.trade_number}</td>
                   <td className="p-3 font-mono">{t.asset}</td>
+                  <td className="p-3 text-right font-mono">₹{Number(t.account_size || 0).toLocaleString()}</td>
                   <td className="p-3 text-right font-mono">{t.risk_per_trade}%</td>
                   <td className={`p-3 font-mono ${t.result_type === "PROFIT" ? "text-mm-green" : "text-mm-red"}`}>{t.result_type}</td>
+                  <td className={`p-3 text-right font-mono ${t.result_type === "PROFIT" ? "text-mm-green" : "text-mm-red"}`}>
+                    {t.result_type === "PROFIT" ? `+₹${Number(t.profit || 0).toLocaleString()}` : `-₹${Number(t.loss || 0).toLocaleString()}`}
+                  </td>
                   <td className={`p-3 text-right font-mono ${t.pl_percentage >= 0 ? "text-mm-green" : "text-mm-red"}`}>{t.pl_percentage}%</td>
-                  <td className="p-3 font-mono text-[11px]">{t.verification_status}</td>
+                  <td className="p-3 font-mono text-[11px]">
+                    <span className={`px-2 py-0.5 rounded font-bold ${
+                      t.verification_status === "VERIFIED" ? "text-mm-green bg-mm-green/10" :
+                      t.verification_status === "REJECTED" ? "text-mm-red bg-mm-red/10" : "text-mm-gold bg-mm-gold/10"
+                    }`}>
+                      {t.verification_status}
+                    </span>
+                    {t.admin_notes && <div className="text-[10px] text-mm-text2 mt-1">({t.admin_notes})</div>}
+                  </td>
                   <td className="p-3">
                     <button onClick={() => verify(t.id, "VERIFIED")} data-testid={`admin-verify-${t.id}`} className="text-[11px] font-mono tracking-widest text-mm-green hover:underline mr-3">VERIFY</button>
                     <button onClick={() => verify(t.id, "REJECTED")} data-testid={`admin-reject-${t.id}`} className="text-[11px] font-mono tracking-widest text-mm-red hover:underline mr-3">REJECT</button>
@@ -259,7 +280,7 @@ export default function Admin() {
                   </td>
                 </tr>
               ))}
-              {trades.length === 0 && <tr><td colSpan="8" className="p-10 text-center text-mm-text2 font-mono text-xs">No trades submitted yet.</td></tr>}
+              {trades.length === 0 && <tr><td colSpan="10" className="p-10 text-center text-mm-text2 font-mono text-xs">No trades submitted yet.</td></tr>}
             </tbody>
           </table>
         </div>

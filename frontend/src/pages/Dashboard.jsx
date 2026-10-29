@@ -17,7 +17,7 @@ const RoundTile = ({ num, title, state, href, tid, cta }) => {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary inline-block">{cta}</Link>;
   } else if (state === "PAUSED") {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-primary border-mm-gold text-mm-gold inline-block">Enter Round (Paused)</Link>;
-  } else if (state === "UPCOMING" && (num === "01" || num === "02")) {
+  } else if (state === "UPCOMING") {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">Enter Waiting Room</Link>;
   } else if (state === "COMPLETED") {
     actionElement = <Link to={href} data-testid={`${tid}-enter`} className="btn-ghost inline-block">View Summary</Link>;

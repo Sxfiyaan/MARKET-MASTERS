@@ -35,7 +35,7 @@ const DEFAULT_CONFIG = {
   round1_weight: 30,
   round2_weight: 30,
   round3_weight: 40,
-  round3_duration_minutes: 60,
+  round3_duration_minutes: 90,
   max_trades: 2,
   starting_capital: 100000,
   max_risk_per_trade: 2,
@@ -503,9 +503,123 @@ export async function advanceRound2State(): Promise<Row> {
   return await getRound2State();
 }
 
-export async function computeScores(targetR1State?: Row, targetR2State?: Row) {
+// Durable Round 3 state loader with controlled error handling
+export async function getRound3State(): Promise<Row> {
+  const { data, error } = await db.from("round3_state").select("*").eq("id", "current").maybeSingle();
+  if (error) {
+    if (error.code === "42P01" || error.message?.includes("does not exist")) {
+      return {
+        id: "current",
+        version: 1,
+        status: "IDLE",
+        phase: "WAITING",
+        round_duration_minutes: 90,
+        phase_start_at: null,
+        phase_ends_at: null,
+        is_paused: false,
+        paused_remaining_ms: 0,
+        updated_at: new Date().toISOString(),
+      };
+    }
+    throw new ApiError(500, `Database error loading Round 3 state: ${error.message}`);
+  }
+  if (!data) {
+    return {
+      id: "current",
+      version: 1,
+      status: "IDLE",
+      phase: "WAITING",
+      round_duration_minutes: 90,
+      phase_start_at: null,
+      phase_ends_at: null,
+      is_paused: false,
+      paused_remaining_ms: 0,
+      updated_at: new Date().toISOString(),
+    };
+  }
+  return data;
+}
+
+let lastR3StateSummary: { version: number; phase: string; status: string } | null = null;
+
+// Procedural transactional state advancement for Round 3
+export async function advanceRound3State(): Promise<Row> {
+  const nowIso = new Date().toISOString();
+  const { data: rpcData, error: rpcError } = await db.rpc("advance_round3_state_tx", {
+    p_now: nowIso,
+  });
+
+  if (!rpcError && rpcData) {
+    if (rpcData.error) {
+      throw new ApiError(500, rpcData.error);
+    }
+    const hasChanged = !lastR3StateSummary ||
+      lastR3StateSummary.version !== rpcData.version ||
+      lastR3StateSummary.phase !== rpcData.phase ||
+      lastR3StateSummary.status !== rpcData.status;
+
+    if (hasChanged) {
+      lastR3StateSummary = {
+        version: rpcData.version,
+        phase: rpcData.phase,
+        status: rpcData.status,
+      };
+      invalidateLeaderboardCache();
+    }
+    if (rpcData.phase === "COMPLETED") {
+      invalidateConfigCache();
+    }
+    return rpcData;
+  }
+
+  if (rpcError) {
+    if (rpcError.code === "42883" || rpcError.code === "42P01" || rpcError.message?.includes("does not exist")) {
+      throw new ApiError(500, "Round 3 database schema or procedure is not initialized. Please apply migration 202610250012_market_masters_synchronized_round3.sql.");
+    }
+    throw new ApiError(500, `Database error advancing Round 3 state: ${rpcError.message}`);
+  }
+
+  return await getRound3State();
+}
+
+export function computeTradePerformanceScore(plPercentage: number): number {
+  const pl = Number(plPercentage) || 0;
+  return Math.max(0, Math.min(1, (pl + 5) / 15)) * 1000;
+}
+
+export function computeTradeRiskScore(riskPerTrade: number, plPercentage: number, maxRiskPerTrade: number): number {
+  const riskPct = Number(riskPerTrade) || 0;
+  const pl = Number(plPercentage) || 0;
+  let risk = 1000;
+
+  // Explicitly identified penalty threshold: Risk > 50% triggers -300 penalty (preserves existing -300 penalty amount)
+  // Exactly 50% does NOT trigger this penalty (riskPct > 50 is false)
+  if (riskPct > 50) {
+    risk -= 300;
+  } else if (riskPct <= Number(maxRiskPerTrade) / 2) {
+    risk += 100;
+  } else {
+    risk += 50;
+  }
+
+  // Loss-based penalty: if loss exceeds 1.5x max risk, penalty -200
+  if (pl < -Number(maxRiskPerTrade) * 1.5) {
+    risk -= 200;
+  }
+
+  return Math.max(0, Math.min(1000, risk));
+}
+
+export function computeTradeScore(trade: Row, cfg: Row): { performance: number; risk: number; total: number } {
+  const performance = computeTradePerformanceScore(trade.pl_percentage);
+  const risk = computeTradeRiskScore(trade.risk_per_trade, trade.pl_percentage, cfg.max_risk_per_trade ?? 2);
+  const total = 0.60 * performance + 0.40 * risk;
+  return { performance, risk, total };
+}
+
+export async function computeScores(targetR1State?: Row, targetR2State?: Row, targetR3State?: Row) {
   const cfg = await config();
-  const [teams, submissions, trades, overrides, previous, r1State, r2State] = await Promise.all([
+  const [teams, submissions, trades, overrides, previous, r1State, r2State, r3State] = await Promise.all([
     all("teams"),
     all("submissions"),
     all("trades"),
@@ -513,6 +627,7 @@ export async function computeScores(targetR1State?: Row, targetR2State?: Row) {
     all("leaderboard_snapshot"),
     targetR1State ? Promise.resolve(targetR1State) : getRound1State(),
     targetR2State ? Promise.resolve(targetR2State) : getRound2State(),
+    targetR3State ? Promise.resolve(targetR3State) : getRound3State(),
   ]);
 
   // Unified closed questions check: Only count Round 1 & Round 2 submissions for genuinely CLOSED questions
@@ -529,51 +644,31 @@ export async function computeScores(targetR1State?: Row, targetR2State?: Row) {
     const r2 = submissions
       .filter((s) => s.team_id === tid && s.round === 2 && closedR2Ids.has(s.question_id))
       .reduce((sum, s) => sum + Number(s.score || 0), 0);
-    // Separate risk metric tracks non-rejected trades (unchanged)
-    const round3Trades = trades.filter((t) => t.team_id === tid && t.verification_status !== "REJECTED");
-    let risk = round3Trades.length ? 1000 : 500;
-    for (const trade of round3Trades) {
-      const riskPct = Number(trade.risk_per_trade || 0);
-      if (riskPct > Number(cfg.max_risk_per_trade)) risk -= 300;
-      else if (riskPct <= Number(cfg.max_risk_per_trade) / 2) risk += 100;
-      else risk += 50;
-      if (Number(trade.pl_percentage || 0) < -Number(cfg.max_risk_per_trade) * 1.5) risk -= 200;
-    }
-    risk = Math.max(0, Math.min(1000, risk));
 
-    // Only VERIFIED trades earn points in Round 3 scoring
-    const verifiedTrades = trades.filter((t) => t.team_id === tid && t.verification_status === "VERIFIED");
-    let performance = 0;
+    const teamTrades = trades.filter((t) => t.team_id === tid);
+    const verifiedTrades = teamTrades.filter((t) => t.verification_status === "VERIFIED");
+
+    // Evaluate each trade separately: trade_score = 0.60 * performance_score + 0.40 * risk_management_score
+    // R3 raw score = (trade_1_score + trade_2_score) / 2
+    // Missing or rejected slots contribute 0; do not redistribute their weight.
+    const trade1 = verifiedTrades.find((t) => Number(t.trade_number) === 1);
+    const trade2 = verifiedTrades.find((t) => Number(t.trade_number) === 2);
+
+    const t1Calc = trade1 ? computeTradeScore(trade1, cfg) : { performance: 0, risk: 0, total: 0 };
+    const t2Calc = trade2 ? computeTradeScore(trade2, cfg) : { performance: 0, risk: 0, total: 0 };
+
+    let r3Raw = (t1Calc.total + t2Calc.total) / 2;
+
     let totalPl = 0;
-    let r3Raw = 0;
+    for (const vt of verifiedTrades) {
+      totalPl += Number(vt.pl_percentage || 0);
+    }
+
+    let avgPerf = verifiedTrades.length > 0 ? (t1Calc.performance + t2Calc.performance) / (trade1 && trade2 ? 2 : 1) : 0;
+    let avgRisk = verifiedTrades.length > 0 ? (t1Calc.risk + t2Calc.risk) / (trade1 && trade2 ? 2 : 1) : 500;
 
     if (overrideMap.has(`${tid}:3`)) {
       r3Raw = Number(overrideMap.get(`${tid}:3`));
-      if (verifiedTrades.length > 0) {
-        totalPl = verifiedTrades.reduce((sum, t) => sum + Number(t.pl_percentage || 0), 0);
-        performance = Math.max(0, Math.min(1, (totalPl + 5) / 15)) * 1000;
-      }
-    } else if (verifiedTrades.length > 0) {
-      totalPl = verifiedTrades.reduce((sum, t) => sum + Number(t.pl_percentage || 0), 0);
-      performance = Math.max(0, Math.min(1, (totalPl + 5) / 15)) * 1000;
-
-      let verifiedRisk = 1000;
-      for (const trade of verifiedTrades) {
-        const riskPct = Number(trade.risk_per_trade || 0);
-        if (riskPct > Number(cfg.max_risk_per_trade)) verifiedRisk -= 300;
-        else if (riskPct <= Number(cfg.max_risk_per_trade) / 2) verifiedRisk += 100;
-        else verifiedRisk += 50;
-        if (Number(trade.pl_percentage || 0) < -Number(cfg.max_risk_per_trade) * 1.5) verifiedRisk -= 200;
-      }
-      verifiedRisk = Math.max(0, Math.min(1000, verifiedRisk));
-
-      const combined = (Number(cfg.performance_weight) / 100) * performance + (Number(cfg.risk_mgmt_weight) / 100) * verifiedRisk;
-      r3Raw = combined;
-    } else {
-      // With no verified trades and no explicit admin override, R3 score must be 0
-      r3Raw = 0;
-      performance = 0;
-      totalPl = 0;
     }
 
     const r1Raw = overrideMap.get(`${tid}:1`) ?? r1;
@@ -581,7 +676,7 @@ export async function computeScores(targetR1State?: Row, targetR2State?: Row) {
     return {
       team_id: tid, team_name: team.team_name, college: team.college,
       round1: Number(r1Raw.toFixed(2)), round2: Number(r2Raw.toFixed(2)), round3: Number(r3Raw.toFixed(2)),
-      performance_score: Number(performance.toFixed(2)), risk_score: Number(risk.toFixed(2)),
+      performance_score: Number(avgPerf.toFixed(2)), risk_score: Number(avgRisk.toFixed(2)),
       total_pl_pct: Number(totalPl.toFixed(2)),
       total: Number(((Number(cfg.round1_weight) / 100) * r1Raw + (Number(cfg.round2_weight) / 100) * r2Raw + (Number(cfg.round3_weight) / 100) * r3Raw).toFixed(2)),
     };
@@ -597,8 +692,8 @@ export async function computeScores(targetR1State?: Row, targetR2State?: Row) {
 }
 
 export async function scores() {
-  const [r1State, r2State] = await Promise.all([getRound1State(), getRound2State()]);
-  const cacheKey = `${r1State.version}:${r1State.status}:${r1State.phase}:${(r1State.closed_question_ids || []).join(",")}|${r2State.version}:${r2State.status}:${r2State.phase}:${(r2State.closed_question_ids || []).join(",")}`;
+  const [r1State, r2State, r3State] = await Promise.all([getRound1State(), getRound2State(), getRound3State()]);
+  const cacheKey = `${r1State.version}:${r1State.status}:${r1State.phase}:${(r1State.closed_question_ids || []).join(",")}|${r2State.version}:${r2State.status}:${r2State.phase}:${(r2State.closed_question_ids || []).join(",")}|${r3State.version}:${r3State.status}:${r3State.phase}:${r3State.is_paused}`;
 
   if (leaderboardCache && leaderboardCache.key === cacheKey && leaderboardCache.generation === cacheGeneration && leaderboardCache.expiresAt > Date.now()) {
     return leaderboardCache.value;
@@ -615,7 +710,7 @@ export async function scores() {
 
   refreshPromise = (async () => {
     try {
-      const rows = await computeScores(r1State, r2State);
+      const rows = await computeScores(r1State, r2State, r3State);
       // Cache generation guard: obsolete calculations cannot refill the cache
       if (cacheGeneration === calculationGen) {
         leaderboardCache = { key: cacheKey, generation: calculationGen, value: rows, expiresAt: Date.now() + CACHE_TTL_MS };
@@ -633,6 +728,7 @@ export async function scores() {
   inFlightLeaderboard.set(cacheKey, { promise: refreshPromise, generation: calculationGen });
   return refreshPromise;
 }
+
 
 async function persistLeaderboardSnapshot(rows: Row[]) {
   const { error: deleteError } = await db.from("leaderboard_snapshot").delete().neq("team_id", "00000000-0000-0000-0000-000000000000");
@@ -904,6 +1000,27 @@ export async function handle(request: Request) {
       invalidateConfigCache();
       invalidateLeaderboardCache();
       await audit(`round2_state_change`, user, { state });
+      return json(request, rpcData.round_value || { state });
+    }
+
+    if (round === 3) {
+      const durationMinutes = Number(body.duration_minutes || body.round_duration_minutes || cfg.round3_duration_minutes || 90);
+      const { data: rpcData, error: rpcError } = await db.rpc("admin_set_round3_state_tx", {
+        p_action: state,
+        p_now: new Date().toISOString(),
+        p_duration_minutes: durationMinutes,
+      });
+
+      if (rpcError) {
+        throw new ApiError(500, `Round 3 state change failed: ${rpcError.message || rpcError}`);
+      }
+      if (rpcData && !rpcData.ok) {
+        throw new ApiError(400, rpcData.error || "Cannot change Round 3 state");
+      }
+
+      invalidateConfigCache();
+      invalidateLeaderboardCache();
+      await audit(`round3_state_change`, user, { state });
       return json(request, rpcData.round_value || { state });
     }
 
@@ -1406,14 +1523,95 @@ export async function handle(request: Request) {
   }
 
   if (method === "POST" && path === "/api/rounds/3/start") {
-    const user = await teamUser(request); const cfg = await activeRound(3); let session = await one("round3_sessions", { team_id: user.profile.team_id });
-    if (!session) { const start = new Date(); const end = new Date(start.getTime() + Number(cfg.round3_duration_minutes) * 60000); session = await insert("round3_sessions", { team_id: user.profile.team_id, started_at: start.toISOString(), ends_at: end.toISOString(), closed: false }); await audit("round3_start", user); }
-    return json(request, { ...session, server_time: new Date().toISOString() });
+    const user = await teamUser(request);
+    const state = await advanceRound3State();
+    if (state.phase !== "ACTIVE" && state.status !== "ACTIVE") {
+      throw new ApiError(400, "Round 3 has not been started by the organizers yet");
+    }
+    const serverTime = new Date().toISOString();
+    return json(request, {
+      team_id: user.profile.team_id,
+      started_at: state.phase_start_at,
+      ends_at: state.phase_ends_at,
+      closed: state.phase === "COMPLETED" || state.status === "COMPLETED",
+      server_time: serverTime,
+      is_paused: !!state.is_paused,
+    });
   }
+
   if (method === "GET" && path === "/api/rounds/3/status") {
-    const user = await teamUser(request); const [session, trades, cfg] = await Promise.all([one("round3_sessions", { team_id: user.profile.team_id }), all("trades", { team_id: user.profile.team_id }, ["trade_number", true]), config()]);
-    return json(request, { session: session ? { ...session, server_time: new Date().toISOString() } : null, trades, max_trades: cfg.max_trades, round_state: cfg.rounds?.["3"]?.state || "UPCOMING", starting_capital: cfg.starting_capital, max_risk_per_trade: cfg.max_risk_per_trade, trade_proof_required: cfg.trade_proof_required });
+    const user = await teamUser(request);
+    const teamId = user.profile.team_id;
+    const [state, trades, cfg] = await Promise.all([
+      advanceRound3State(),
+      all("trades", { team_id: teamId }, ["trade_number", true]),
+      config(),
+    ]);
+
+    const now = Date.now();
+    let timeLeft = 0;
+    if (state.is_paused) {
+      timeLeft = Math.max(0, Math.floor((Number(state.paused_remaining_ms) || 0) / 1000));
+    } else if (state.phase_ends_at && (state.phase === "ACTIVE" || state.status === "ACTIVE")) {
+      const diffMs = new Date(state.phase_ends_at).getTime() - now;
+      timeLeft = Math.max(0, Math.floor(diffMs / 1000));
+    }
+
+    const trade1 = trades.find((t) => Number(t.trade_number) === 1);
+    const trade2 = trades.find((t) => Number(t.trade_number) === 2);
+
+    const tradesWithScores = trades.map((t) => {
+      const calc = computeTradeScore(t, cfg);
+      return {
+        ...t,
+        performance_score: Number(calc.performance.toFixed(2)),
+        risk_score: Number(calc.risk.toFixed(2)),
+        trade_score: Number(calc.total.toFixed(2)),
+      };
+    });
+
+    const t1Calc = trade1 ? computeTradeScore(trade1, cfg) : { performance: 0, risk: 0, total: 0 };
+    const t2Calc = trade2 ? computeTradeScore(trade2, cfg) : { performance: 0, risk: 0, total: 0 };
+
+    // Verified score: only VERIFIED trades contribute
+    const t1VerifiedScore = trade1 && trade1.verification_status === "VERIFIED" ? t1Calc.total : 0;
+    const t2VerifiedScore = trade2 && trade2.verification_status === "VERIFIED" ? t2Calc.total : 0;
+    const r3VerifiedScore = Number(((t1VerifiedScore + t2VerifiedScore) / 2).toFixed(2));
+
+    // Provisional score: VERIFIED or PENDING trades evaluate
+    const t1ProvScore = trade1 && (trade1.verification_status === "VERIFIED" || trade1.verification_status === "PENDING") ? t1Calc.total : 0;
+    const t2ProvScore = trade2 && (trade2.verification_status === "VERIFIED" || trade2.verification_status === "PENDING") ? t2Calc.total : 0;
+    const r3ProvisionalScore = Number(((t1ProvScore + t2ProvScore) / 2).toFixed(2));
+
+    const hasPendingTrades = trades.some((t) => t.verification_status === "PENDING");
+    const roundState = (state.phase === "COMPLETED" || state.status === "COMPLETED") ? "COMPLETED" : (cfg.rounds?.["3"]?.state || state.status || "UPCOMING");
+
+    return json(request, {
+      round_state: roundState,
+      status: state.status,
+      phase: state.phase,
+      phase_start_at: state.phase_start_at,
+      phase_ends_at: state.phase_ends_at,
+      is_paused: !!state.is_paused,
+      time_left: timeLeft,
+      trades: tradesWithScores,
+      max_trades: 2,
+      starting_capital: cfg.starting_capital,
+      max_risk_per_trade: cfg.max_risk_per_trade,
+      trade_proof_required: false,
+      has_pending_trades: hasPendingTrades,
+      r3_score: r3VerifiedScore,
+      r3_provisional_score: r3ProvisionalScore,
+      session: {
+        team_id: teamId,
+        started_at: state.phase_start_at,
+        ends_at: state.phase_ends_at,
+        closed: state.phase === "COMPLETED" || state.status === "COMPLETED",
+        server_time: new Date().toISOString(),
+      },
+    });
   }
+
   if (method === "POST" && path === "/api/rounds/3/trades") {
     const user = await teamUser(request);
     const body = await readBody(request);
@@ -1422,12 +1620,37 @@ export async function handle(request: Request) {
     const loss = Number(body.loss || 0);
     const pl = Number(body.pl_percentage);
     const risk = Number(body.risk_per_trade);
-    if (!Number.isFinite(risk) || risk < 0) throw new ApiError(422, "Risk % must be >= 0");
-    if (resultType === "PROFIT" && (profit <= 0 || loss !== 0 || pl <= 0)) throw new ApiError(400, "Profit must be > 0, loss must be 0, and P/L % must be positive for PROFIT");
-    if (resultType === "LOSS" && (loss <= 0 || profit !== 0 || pl >= 0)) throw new ApiError(400, "Loss must be > 0, profit must be 0, and P/L % must be negative for LOSS");
-    if (!["PROFIT", "LOSS"].includes(resultType)) throw new ApiError(422, "Invalid result_type");
+    const tradeNumber = body.trade_number != null ? Number(body.trade_number) : null;
+
     const asset = requiredString(body.asset, "asset");
     const accountSize = Number(body.account_size);
+
+    if (!Number.isFinite(accountSize) || accountSize <= 0) throw new ApiError(422, "Account size must be greater than zero");
+    if (!Number.isFinite(risk) || risk < 0) throw new ApiError(422, "Risk % must be >= 0");
+    if (!Number.isFinite(profit) || profit < 0) throw new ApiError(422, "Profit must be non-negative");
+    if (!Number.isFinite(loss) || loss < 0) throw new ApiError(422, "Loss must be non-negative");
+    if (!Number.isFinite(pl)) throw new ApiError(422, "P/L percentage must be a valid number");
+
+    if (resultType === "PROFIT") {
+      if (profit <= 0 || loss !== 0 || pl <= 0) throw new ApiError(400, "Profit must be > 0, loss must be 0, and P/L % must be positive for PROFIT");
+    } else if (resultType === "LOSS") {
+      if (loss <= 0 || profit !== 0 || pl >= 0) throw new ApiError(400, "Loss must be > 0, profit must be 0, and P/L % must be negative for LOSS");
+    } else {
+      throw new ApiError(422, "Invalid result_type (must be PROFIT or LOSS)");
+    }
+
+    // Authoritative calculation of P/L %: 100 * (profit - loss) / account_size
+    const expectedPl = ((profit - loss) / accountSize) * 100;
+    // Allow up to 0.05% rounding tolerance between entered percentage and exact calculated return
+    if (Math.abs(pl - expectedPl) > 0.05) {
+      throw new ApiError(400, `Submitted P/L % (${pl}%) does not agree with calculated return from profit/loss and account size (${expectedPl.toFixed(2)}%)`);
+    }
+
+    const authoritativePl = Number(expectedPl.toFixed(2));
+
+    if (tradeNumber != null && (!Number.isInteger(tradeNumber) || tradeNumber < 1 || tradeNumber > 2)) {
+      throw new ApiError(422, "trade_number must be 1 or 2");
+    }
 
     const { data: rpcData, error: rpcError } = await db.rpc("submit_round3_trade_tx", {
       p_team_id: user.profile.team_id,
@@ -1437,19 +1660,26 @@ export async function handle(request: Request) {
       p_result_type: resultType,
       p_profit: profit,
       p_loss: loss,
-      p_pl_percentage: pl,
+      p_pl_percentage: authoritativePl,
       p_proof_url: body.proof_url || null,
+      p_trade_number: tradeNumber,
     });
 
     if (rpcError) {
+      if (rpcError.code === "42883" || rpcError.code === "42P01" || rpcError.message?.includes("does not exist")) {
+        throw new ApiError(500, "Round 3 database procedure 'submit_round3_trade_tx' is not initialized. Please apply migration 202610250013_market_masters_round3_authoritative_pl_and_cleanup.sql.");
+      }
       throw new ApiError(500, `Round 3 trade submission failed: ${rpcError.message || rpcError}`);
     }
     if (rpcData && !rpcData.ok) {
       if (rpcData.code === "FINALIZED") throw new ApiError(400, "Results are finalized. Submissions are closed.");
       if (rpcData.code === "NOT_ACTIVE") throw new ApiError(400, "Round 3 is not active");
-      if (rpcData.code === "NO_SESSION") throw new ApiError(400, "Start Round 3 first");
-      if (rpcData.code === "SESSION_CLOSED") throw new ApiError(400, "Round 3 window has closed");
-      if (rpcData.code === "TRADE_LIMIT") throw new ApiError(400, "Trade limit reached");
+      if (rpcData.code === "ROUND_PAUSED") throw new ApiError(400, "Round 3 is paused");
+      if (rpcData.code === "DEADLINE_EXPIRED" || rpcData.code === "SESSION_CLOSED") throw new ApiError(400, "Round 3 window has closed");
+      if (rpcData.code === "SLOT_ALREADY_USED") throw new ApiError(409, rpcData.error || "Trade slot already used");
+      if (rpcData.code === "TRADE_LIMIT") throw new ApiError(400, "Trade limit reached (2 trades maximum)");
+      if (rpcData.code === "INVALID_SLOT") throw new ApiError(422, rpcData.error || "Invalid trade slot");
+      if (rpcData.code?.startsWith("INVALID_")) throw new ApiError(400, rpcData.error);
       throw new ApiError(400, rpcData.error || "Trade submission failed");
     }
 
@@ -1457,7 +1687,13 @@ export async function handle(request: Request) {
     await audit("round3_trade_submit", user, { trade_number: rpcData.trade.trade_number, asset: rpcData.trade.asset });
     return json(request, rpcData.trade);
   }
-  if (method === "POST" && path === "/api/rounds/3/close") { const user = await teamUser(request); await db.from("round3_sessions").update({ closed: true }).eq("team_id", user.profile.team_id); await audit("round3_close", user); return json(request, { ok: true }); }
+
+  if (method === "POST" && path === "/api/rounds/3/close") {
+    // Retained for backward-compat; shared timer auto-expires authoritatively on deadline
+    const user = await teamUser(request);
+    await audit("round3_close", user);
+    return json(request, { ok: true });
+  }
 
   if (method === "GET" && path === "/api/leaderboard") { const cfg = await config(); if (!cfg.leaderboard_visible) return publicJson(request, { visible: false, rows: [] }); return publicJson(request, { visible: true, rows: await scores() }); }
   if (method === "GET" && path === "/api/scores/me") { const user = await teamUser(request); const row = (await scores()).find((item) => item.team_id === user.profile.team_id); return json(request, row || { rank: null, total: 0 }); }

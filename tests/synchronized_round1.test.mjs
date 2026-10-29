@@ -1662,7 +1662,7 @@ test("14. Authoritative Results Finalization: R3 completion and Stop Event do no
     async () => await handle(new Request("http://localhost/api/rounds/3/trades", {
       method: "POST",
       headers: { authorization: "Bearer user-alpha-1", "content-type": "application/json" },
-      body: JSON.stringify({ asset: "AAPL", account_size: 100000, risk_per_trade: 1, result_type: "PROFIT", profit: 500, loss: 0, pl_percentage: 1 }),
+      body: JSON.stringify({ asset: "AAPL", account_size: 100000, risk_per_trade: 1, result_type: "PROFIT", profit: 1000, loss: 0, pl_percentage: 1 }),
     })),
     (err) => err instanceof ApiError && err.status === 400 && err.message.includes("Results are finalized")
   );
