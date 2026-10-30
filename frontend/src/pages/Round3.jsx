@@ -33,6 +33,7 @@ export default function Round3() {
 
   const skewRef = useRef(0);
   const isPollingRef = useRef(false);
+  const deadlineCheckRequestedRef = useRef(false);
 
   const loadStatus = useCallback(async () => {
     if (isPollingRef.current) return;
@@ -64,19 +65,28 @@ export default function Round3() {
     return () => clearInterval(interval);
   }, [loadStatus]);
 
+  const phaseEndsAt = status?.phase_ends_at;
+  const timerIsPaused = status?.is_paused;
+  const timerRoundState = status?.round_state;
+
   // Local timer tick
   useEffect(() => {
-    if (!status || status.is_paused || status.round_state !== "ACTIVE" || !status.phase_ends_at) return;
-    const t = setInterval(() => {
-      const end = new Date(status.phase_ends_at).getTime();
+    if (timerIsPaused || timerRoundState !== "ACTIVE" || !phaseEndsAt) return;
+
+    deadlineCheckRequestedRef.current = false;
+    const end = new Date(phaseEndsAt).getTime();
+    const interval = setInterval(() => {
       const now = Date.now() + skewRef.current;
       const remaining = Math.max(0, (end - now) / 1000);
       setLeft(remaining);
-      if (remaining <= 0 && status.round_state === "ACTIVE") {
+      if (remaining <= 0 && !deadlineCheckRequestedRef.current) {
+        deadlineCheckRequestedRef.current = true;
         loadStatus();
       }
     }, 500);
-  }, [status, loadStatus]);
+
+    return () => clearInterval(interval);
+  }, [timerIsPaused, timerRoundState, phaseEndsAt, loadStatus]);
 
   // Adjust default target slot to first empty slot
   useEffect(() => {
